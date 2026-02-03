@@ -88,10 +88,6 @@ zephyr_udc0: &usbd {
 	};
 };
 
-&cryptocell {
-	status = "disabled";
-};
-
 &nfct {
 	status = "disabled";
 };
