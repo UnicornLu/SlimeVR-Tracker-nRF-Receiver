@@ -25,12 +25,6 @@
 		rx-gain-db = <19>;
 	};
 
-
-	aliases {
-		ant-set-gpios = <&gpio0 28 GPIO_ACTIVE_HIGH>;
-		csd-gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
-	};
-
 	zephyr,user {
 		led-gpios = <&gpio0 4 GPIO_OPEN_SOURCE>;
 		ant-set-gpios = <&gpio0 28 GPIO_ACTIVE_HIGH>;
