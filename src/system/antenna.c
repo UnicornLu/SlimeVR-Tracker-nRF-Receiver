@@ -211,13 +211,26 @@ void antenna_periodic_switch(void)
 	struct antenna_eval_stats eval[2] = {antenna_eval[0], antenna_eval[1]};
 	k_spin_unlock(&antenna_lock, key);
 
-	if (!eval[0].valid || !eval[1].valid) {
-		last_switch_time = now;
-		return;
-	}
-
-	if (now - eval[0].last_update_ms > ANTENNA_STATS_STALE_MS
-		|| now - eval[1].last_update_ms > ANTENNA_STATS_STALE_MS) {
+	bool stale[2] = {
+		!eval[0].valid || (now - eval[0].last_update_ms > ANTENNA_STATS_STALE_MS),
+		!eval[1].valid || (now - eval[1].last_update_ms > ANTENNA_STATS_STALE_MS),
+	};
+	if (stale[0] || stale[1]) {
+		uint8_t target = current_antenna;
+		if (stale[0] && !stale[1]) {
+			target = 0;
+		} else if (stale[1] && !stale[0]) {
+			target = 1;
+		} else {
+			target = !current_antenna;
+		}
+		if (target != current_antenna) {
+			if (target == 0) {
+				antenna_select_0();
+			} else {
+				antenna_select_1();
+			}
+		}
 		last_switch_time = now;
 		return;
 	}
