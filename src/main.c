@@ -24,6 +24,7 @@
 #include "system/system.h"
 #include "system/led.h"
 #include "system/status.h"
+#include "system/antenna.h"
 #include "connection/esb.h"
 
 #include <zephyr/kernel.h>
@@ -43,6 +44,9 @@ int main(void)
 {
 	// Initialize LED system first
 	set_led(SYS_LED_PATTERN_ACTIVE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
+
+	// Initialize antenna diversity control
+	antenna_init();
 
 	// Boot sequence with button detection
 	set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_BOOT);

@@ -35,9 +35,9 @@
 
 	nrf_radio_fem: se2431_fem {
 		compatible = "skyworks,se2431", "generic-fem-two-ctrl-pins";
-		ctx-gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+		ctx-gpios = <&gpio0 30 GPIO_ACTIVE_HIGH>;  /* TXEN */
 		ctx-settle-time-us = <23>;
-		crx-gpios = <&gpio0 22 GPIO_ACTIVE_HIGH>;
+		crx-gpios = <&gpio0 29 GPIO_ACTIVE_HIGH>;  /* RXEN */
 		crx-settle-time-us = <8>;
 		tx-gain-db = <20>;
 		rx-gain-db = <12>;
@@ -56,6 +56,8 @@
 
 	zephyr,user {
 		led-gpios = <&gpio0 15 GPIO_OPEN_SOURCE>;
+		ant-set-gpios = <&gpio0 28 GPIO_ACTIVE_HIGH>;
+		csd-gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
 	};
 };
 

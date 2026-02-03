@@ -30,6 +30,7 @@
 #include "globals.h"
 #include "hid.h"
 #include "system/system.h"
+#include "system/antenna.h"
 
 #define RADIO_RETRANSMIT_DELAY CONFIG_RADIO_RETRANSMIT_DELAY
 #define RADIO_RF_CHANNEL CONFIG_RADIO_RF_CHANNEL
@@ -1648,13 +1649,16 @@ static void esb_thread(void)
 		esb_start_rx();
 	}
 
-	while (1) {
+		while (1) {
 		if (!esb_paired && !esb_clearing) {
 			esb_pair();
 			esb_receive();
 			esb_initialize(false);
 			esb_start_rx();
 		}
+
+		// Periodic antenna switching for diversity
+		antenna_periodic_switch();
 
 		// Check if channel change is complete
 		if (channel_change_pending) {
