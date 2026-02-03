@@ -33,6 +33,16 @@
 		zephyr,shell-uart = &cdc_acm_uart0;
 	};
 
+	nrf_radio_fem: se2431_fem {
+		compatible = "skyworks,se2431", "generic-fem-two-ctrl-pins";
+		ctx-gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+		ctx-settle-time-us = <23>;
+		crx-gpios = <&gpio0 22 GPIO_ACTIVE_HIGH>;
+		crx-settle-time-us = <8>;
+		tx-gain-db = <20>;
+		rx-gain-db = <12>;
+	};
+
 	pwmleds {
 		compatible = "pwm-leds";
 		pwm_led0: pwm_led_0 {
@@ -82,4 +92,8 @@ zephyr_udc0: &usbd {
 
 &nfct {
 	status = "disabled";
+};
+
+&radio {
+	fem = <&nrf_radio_fem>;
 };

@@ -33,4 +33,4 @@ config MPSL_FEM_GENERIC_TWO_CTRL_PINS_SUPPORT
     bool
     default y
 
-endif # BOARD_STYRIA_R1_UF2
+endif # BOARD_NINI_SLIMEVR_UF2
