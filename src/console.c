@@ -490,6 +490,9 @@ static void console_thread(void)
 				} else if (strcmp(arg2, "dfu") == 0) {
 					cmd_flag = ESB_PONG_FLAG_DFU;
 					cmd_name = "DFU mode";
+				} else if (strcmp(arg2, "fusion") == 0) {
+					cmd_flag = ESB_PONG_FLAG_FUSION_RESET;
+					cmd_name = "Fusion reset";
 				} else if (strcmp(arg2, "channel") == 0) {
 					// Special handling for channel command - needs arg3
 					if (!arg3) {
@@ -635,11 +638,12 @@ static void console_thread(void)
 					}
 					continue;
 				} else if (strcmp(arg2, "tcal") == 0) {
-					// tcal command - supports "auto on/off" and "clear"
+					// tcal command - supports "auto on/off", "boot on/off" and "clear"
 					if (!arg3) {
-						printk("Usage: send <id|all> tcal <auto on|auto off|clear>\n");
+						printk("Usage: send <id|all> tcal <auto on|auto off|boot on|boot off|boot on|boot off|clear>\n");
 						printk("Example: send 0 tcal auto on  - Enable auto-calibration on tracker 0\n");
 						printk("Example: send all tcal auto off - Disable auto-calibration on all trackers\n");
+						printk("Example: send 0 tcal boot on - Enable boot calibration on tracker 0\n");
 						printk("Example: send 0 tcal clear - Clear temperature calibration on tracker 0\n");
 						continue;
 					}
@@ -680,8 +684,35 @@ static void console_thread(void)
 							esb_send_remote_command(tracker_id, ESB_PONG_FLAG_RESET_TCAL);
 							printk("T-Cal clear request sent to tracker %d\n", tracker_id);
 						}
+					} else if (strcmp(arg3, "boot") == 0) {
+						if (!arg4) {
+							printk("Usage: send <id|all> tcal boot <on|off>\n");
+							continue;
+						}
+
+						uint8_t tcal_cmd = 0xFF;
+						const char *tcal_name = NULL;
+
+						if (strcmp(arg4, "on") == 0) {
+							tcal_cmd = ESB_PONG_FLAG_TCAL_BOOT_ON;
+							tcal_name = "T-Cal boot-calibration enable";
+						} else if (strcmp(arg4, "off") == 0) {
+							tcal_cmd = ESB_PONG_FLAG_TCAL_BOOT_OFF;
+							tcal_name = "T-Cal boot-calibration disable";
+						} else {
+							printk("Invalid tcal boot argument: %s (use 'on' or 'off')\n", arg4);
+							continue;
+						}
+
+						if (target_all) {
+							esb_send_remote_command_all(tcal_cmd);
+							printk("%s request sent to all trackers\n", tcal_name);
+						} else {
+							esb_send_remote_command(tracker_id, tcal_cmd);
+							printk("%s request sent to tracker %d\n", tcal_name, tracker_id);
+						}
 					} else {
-						printk("Unknown tcal subcommand: %s (use 'auto' or 'clear')\n", arg3);
+						printk("Unknown tcal subcommand: %s (use 'auto', 'boot' or 'clear')\n", arg3);
 					}
 					continue;
 				}
@@ -697,7 +728,7 @@ static void console_thread(void)
 				} else {
 					printk("Unknown command: %s\n", arg2);
 					printk(
-						"Available commands: shutdown, calibrate, 6-side, meow, scan, mag, reboot, clear, dfu, sens, "
+						"Available commands: shutdown, calibrate, 6-side, meow, scan, mag, reboot, clear, dfu, fusion, sens, "
 						"reset, ping, tcal\n"
 					);
 				}

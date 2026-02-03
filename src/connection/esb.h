@@ -55,6 +55,9 @@
 #define ESB_PONG_FLAG_RESET_TCAL 0x12
 #define ESB_PONG_FLAG_TCAL_AUTO_ON 0x13  // Enable T-Cal auto-calibration
 #define ESB_PONG_FLAG_TCAL_AUTO_OFF 0x14 // Disable T-Cal auto-calibration
+#define ESB_PONG_FLAG_FUSION_RESET 0x15  // Reset fusion (invalidate quaternion)
+#define ESB_PONG_FLAG_TCAL_BOOT_ON 0x16  // Enable T-Cal boot calibration
+#define ESB_PONG_FLAG_TCAL_BOOT_OFF 0x17 // Disable T-Cal boot calibration
 
 void event_handler(struct esb_evt const *event);
 int clocks_start(void);

@@ -1425,6 +1425,42 @@ void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag)
 		case ESB_PONG_FLAG_SET_CHANNEL:
 			cmd_name = "SET_CHANNEL";
 			break;
+		case ESB_PONG_FLAG_SENS_SET:
+			cmd_name = "SENS_SET";
+			break;
+		case ESB_PONG_FLAG_SENS_RESET:
+			cmd_name = "SENS_RESET";
+			break;
+		case ESB_PONG_FLAG_RESET_ZRO:
+			cmd_name = "RESET_ZRO";
+			break;
+		case ESB_PONG_FLAG_RESET_ACC:
+			cmd_name = "RESET_ACC";
+			break;
+		case ESB_PONG_FLAG_RESET_BAT:
+			cmd_name = "RESET_BAT";
+			break;
+		case ESB_PONG_FLAG_PING:
+			cmd_name = "PING";
+			break;
+		case ESB_PONG_FLAG_RESET_TCAL:
+			cmd_name = "RESET_TCAL";
+			break;
+		case ESB_PONG_FLAG_TCAL_AUTO_ON:
+			cmd_name = "TCAL_AUTO_ON";
+			break;
+		case ESB_PONG_FLAG_TCAL_AUTO_OFF:
+			cmd_name = "TCAL_AUTO_OFF";
+			break;
+		case ESB_PONG_FLAG_FUSION_RESET:
+			cmd_name = "FUSION_RESET";
+			break;
+		case ESB_PONG_FLAG_TCAL_BOOT_ON:
+			cmd_name = "TCAL_BOOT_ON";
+			break;
+		case ESB_PONG_FLAG_TCAL_BOOT_OFF:
+			cmd_name = "TCAL_BOOT_OFF";
+			break;
 		}
 		LOG_INF("Remote command %s (0x%02X) queued for tracker %d", cmd_name, command_flag, tracker_id);
 	} else {
@@ -1470,6 +1506,42 @@ void esb_send_remote_command_all(uint8_t command_flag)
 		break;
 	case ESB_PONG_FLAG_SET_CHANNEL:
 		cmd_name = "SET_CHANNEL";
+		break;
+	case ESB_PONG_FLAG_SENS_SET:
+		cmd_name = "SENS_SET";
+		break;
+	case ESB_PONG_FLAG_SENS_RESET:
+		cmd_name = "SENS_RESET";
+		break;
+	case ESB_PONG_FLAG_RESET_ZRO:
+		cmd_name = "RESET_ZRO";
+		break;
+	case ESB_PONG_FLAG_RESET_ACC:
+		cmd_name = "RESET_ACC";
+		break;
+	case ESB_PONG_FLAG_RESET_BAT:
+		cmd_name = "RESET_BAT";
+		break;
+	case ESB_PONG_FLAG_PING:
+		cmd_name = "PING";
+		break;
+	case ESB_PONG_FLAG_RESET_TCAL:
+		cmd_name = "RESET_TCAL";
+		break;
+	case ESB_PONG_FLAG_TCAL_AUTO_ON:
+		cmd_name = "TCAL_AUTO_ON";
+		break;
+	case ESB_PONG_FLAG_TCAL_AUTO_OFF:
+		cmd_name = "TCAL_AUTO_OFF";
+		break;
+	case ESB_PONG_FLAG_FUSION_RESET:
+		cmd_name = "FUSION_RESET";
+		break;
+	case ESB_PONG_FLAG_TCAL_BOOT_ON:
+		cmd_name = "TCAL_BOOT_ON";
+		break;
+	case ESB_PONG_FLAG_TCAL_BOOT_OFF:
+		cmd_name = "TCAL_BOOT_OFF";
 		break;
 	}
 
