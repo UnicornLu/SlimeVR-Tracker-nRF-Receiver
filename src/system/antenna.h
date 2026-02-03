@@ -41,8 +41,13 @@ void antenna_toggle(void);
 // Get current antenna selection (0 or 1)
 uint8_t antenna_get_current(void);
 
+// Record RSSI for a received packet on the current antenna
+void antenna_record_rx(int8_t rssi);
+
+// Record lost packets (estimated) for the current antenna
+void antenna_record_loss(uint32_t lost_packets);
+
 // Periodic antenna switching (call this periodically for diversity)
 void antenna_periodic_switch(void);
 
 #endif
-

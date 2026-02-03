@@ -25,6 +25,8 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/spinlock.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(antenna, LOG_LEVEL_INF);
 
@@ -48,7 +50,28 @@ static const struct gpio_dt_spec csd = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, csd_gp
 
 static uint8_t current_antenna = 0; // 0 = antenna 0, 1 = antenna 1
 static int64_t last_switch_time = 0;
-#define ANTENNA_SWITCH_INTERVAL_MS 1000 // Switch antenna every 1 second for diversity
+#define ANTENNA_SWITCH_INTERVAL_MS 200 // Evaluate antenna selection every 200 ms
+#define ANTENNA_HYSTERESIS_DB 3
+#define ANTENNA_LOSS_PENALTY_DIV 10 // 1 dB penalty per 10% loss (permille/10)
+#define ANTENNA_STATS_STALE_MS 1000
+
+struct antenna_window_stats {
+	int32_t rssi_sum;
+	uint32_t rssi_count;
+	uint32_t received_packets;
+	uint32_t lost_packets;
+};
+
+struct antenna_eval_stats {
+	int32_t avg_rssi;
+	uint32_t loss_rate_permille;
+	int64_t last_update_ms;
+	bool valid;
+};
+
+static struct antenna_window_stats antenna_window[2] = {0};
+static struct antenna_eval_stats antenna_eval[2] = {0};
+static struct k_spinlock antenna_lock;
 
 int antenna_init(void)
 {
@@ -88,6 +111,8 @@ int antenna_init(void)
 
 	current_antenna = 0;
 	last_switch_time = k_uptime_get();
+	memset(antenna_window, 0, sizeof(antenna_window));
+	memset(antenna_eval, 0, sizeof(antenna_eval));
 
 	return 0;
 }
@@ -124,14 +149,89 @@ uint8_t antenna_get_current(void)
 	return current_antenna;
 }
 
+void antenna_record_rx(int8_t rssi)
+{
+#if ANT_SET_AVAILABLE
+	k_spinlock_key_t key = k_spin_lock(&antenna_lock);
+	struct antenna_window_stats *stats = &antenna_window[current_antenna];
+	stats->rssi_sum += rssi;
+	stats->rssi_count++;
+	stats->received_packets++;
+	k_spin_unlock(&antenna_lock, key);
+#endif
+}
+
+void antenna_record_loss(uint32_t lost_packets)
+{
+#if ANT_SET_AVAILABLE
+	if (lost_packets == 0) {
+		return;
+	}
+	k_spinlock_key_t key = k_spin_lock(&antenna_lock);
+	antenna_window[current_antenna].lost_packets += lost_packets;
+	k_spin_unlock(&antenna_lock, key);
+#endif
+}
+
+static void antenna_update_eval_stats(int64_t now_ms)
+{
+	for (int i = 0; i < 2; i++) {
+		struct antenna_window_stats *window = &antenna_window[i];
+		if (window->rssi_count == 0 && window->lost_packets == 0 && window->received_packets == 0) {
+			continue;
+		}
+		int32_t avg_rssi = 0;
+		if (window->rssi_count > 0) {
+			avg_rssi = window->rssi_sum / (int32_t)window->rssi_count;
+		}
+		uint32_t total_packets = window->received_packets + window->lost_packets;
+		uint32_t loss_rate_permille = 1000;
+		if (total_packets > 0) {
+			loss_rate_permille = (window->lost_packets * 1000U) / total_packets;
+		}
+		antenna_eval[i].avg_rssi = avg_rssi;
+		antenna_eval[i].loss_rate_permille = loss_rate_permille;
+		antenna_eval[i].last_update_ms = now_ms;
+		antenna_eval[i].valid = true;
+
+		memset(window, 0, sizeof(*window));
+	}
+}
+
 void antenna_periodic_switch(void)
 {
 #if ANT_SET_AVAILABLE
 	int64_t now = k_uptime_get();
-	if (now - last_switch_time >= ANTENNA_SWITCH_INTERVAL_MS) {
-		antenna_toggle();
-		last_switch_time = now;
+	if (now - last_switch_time < ANTENNA_SWITCH_INTERVAL_MS) {
+		return;
 	}
+
+	k_spinlock_key_t key = k_spin_lock(&antenna_lock);
+	antenna_update_eval_stats(now);
+	struct antenna_eval_stats eval[2] = {antenna_eval[0], antenna_eval[1]};
+	k_spin_unlock(&antenna_lock, key);
+
+	if (!eval[0].valid || !eval[1].valid) {
+		last_switch_time = now;
+		return;
+	}
+
+	if (now - eval[0].last_update_ms > ANTENNA_STATS_STALE_MS
+		|| now - eval[1].last_update_ms > ANTENNA_STATS_STALE_MS) {
+		last_switch_time = now;
+		return;
+	}
+
+	int32_t score0 = eval[0].avg_rssi - (int32_t)(eval[0].loss_rate_permille / ANTENNA_LOSS_PENALTY_DIV);
+	int32_t score1 = eval[1].avg_rssi - (int32_t)(eval[1].loss_rate_permille / ANTENNA_LOSS_PENALTY_DIV);
+	int32_t diff = score1 - score0;
+
+	if (diff > ANTENNA_HYSTERESIS_DB && current_antenna != 1) {
+		antenna_select_1();
+	} else if (diff < -ANTENNA_HYSTERESIS_DB && current_antenna != 0) {
+		antenna_select_0();
+	}
+
+	last_switch_time = now;
 #endif
 }
-

@@ -253,6 +253,7 @@ static int check_packet_sequence(uint8_t tracker_id, uint8_t received_seq)
 		stats->total_received++;
 		stats->gap_events++;
 		stats->total_gaps += (diff_forward - 1); // Estimate number of lost packets
+		antenna_record_loss(diff_forward - 1);
 		last_packet_sequence[tracker_id] = received_seq;
 		packet_count[tracker_id]++;
 		stats->last_sequence = received_seq;
@@ -429,6 +430,7 @@ void event_handler(struct esb_evt const *event)
 				LOG_ERR("Error while reading rx packet: %d", err);
 				break;
 			}
+			antenna_record_rx(rx_payload.rssi);
 			switch (rx_payload.length) {
 			case 1: // ACK packet
 				LOG_DBG("RX ACK len=%u pipe=%u data=%02X", rx_payload.length, rx_payload.pipe, rx_payload.data[0]);
