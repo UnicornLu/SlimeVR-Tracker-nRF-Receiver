@@ -33,6 +33,7 @@
 
 #define RADIO_RETRANSMIT_DELAY CONFIG_RADIO_RETRANSMIT_DELAY
 #define RADIO_RF_CHANNEL CONFIG_RADIO_RF_CHANNEL
+#define PAIRING_TIMEOUT_SECONDS CONFIG_PAIRING_TIMEOUT
 
 // TDMA parameters (copied from Tracker)
 #define TDMA_ENABLED 0
@@ -50,20 +51,6 @@ static struct esb_payload tx_payload_pair = ESB_CREATE_PAYLOAD(0, 0, 0, 0, 0, 0,
 // 0, 0, 0, 0, 0, 0, 0);
 static struct esb_payload tx_payload_sync = ESB_CREATE_PAYLOAD(0, 0, 0, 0, 0);
 
-// TX statistics
-struct tx_stats {
-	uint32_t total_success;          // Total successful transmissions
-	uint32_t total_failed;           // Total failed transmissions
-	uint32_t consecutive_fails;      // Consecutive failed transmissions
-	int64_t last_fail_time;          // Last failure timestamp
-	int64_t last_log_time;           // Last log timestamp
-	uint32_t success_since_last_log; // Successful transmissions since last log
-	uint32_t failed_since_last_log;  // Failed transmissions since last log
-};
-static struct tx_stats tx_statistics = {0};
-
-#define TX_LOG_INTERVAL_MS 1000 // TX statistics log interval (max once per second)
-
 struct pairing_event {
 	uint8_t packet[8];
 };
@@ -80,20 +67,49 @@ static bool ping_counter_initialized[MAX_TRACKERS]
 static uint64_t last_ping_time[MAX_TRACKERS] = {0}; // Track the last time a PING was received from each tracker
 static uint8_t last_pong_queued_counter[MAX_TRACKERS] = {0}; // Track the last PONG counter enqueued for each tracker
 static uint8_t packet_count[MAX_TRACKERS] = {0};             // Packet count received from each tracker
-static uint8_t tracker_remote_command[MAX_TRACKERS] = {ESB_PONG_FLAG_NORMAL}; // Tracker remote command flag
-static uint32_t tracker_channel_value = 0;               // Channel value to be set (for SET_CHANNEL command)
-static int16_t pending_sens_data[MAX_TRACKERS][3] = {0}; // Store pending sensitivity data
+// Shared ACK state: written by threads/event_handler, read by ack_handler (radio ISR).
+// On single-core Cortex-M, volatile ensures visibility between ISR priorities.
+static volatile uint8_t tracker_remote_command[MAX_TRACKERS]; // Command flag for next PONG
+static volatile uint32_t tracker_channel_value;               // Channel value for SET_CHANNEL command
+static volatile int16_t pending_sens_data[MAX_TRACKERS][3];   // SENS_SET sensitivity data
 static uint8_t receiver_rf_channel = 0xFF; // Current RF channel of the receiver, 0xFF indicates using default value
 
 #define PING_TIMEOUT_MS 5000 // PING timeout threshold: 5 seconds
 
 // Channel change confirmation tracking
-static bool channel_change_pending = false; // Indicates if a channel change is pending
-static uint8_t pending_channel = 0;         // The channel value to switch to
+static atomic_t channel_change_pending = ATOMIC_INIT(0); // Indicates if a channel change is pending
+static uint8_t pending_channel = 0;                      // The channel value to switch to
 static atomic_t channel_ack_mask
 	= ATOMIC_INIT(0);                      // Bitmask to track which trackers have acknowledged the channel change
 static int64_t channel_change_timeout = 0; // Timestamp for channel change timeout
 #define CHANNEL_CHANGE_TIMEOUT_MS 30000    // Timeout duration for waiting for all trackers to acknowledge
+
+// Pairing state (declared here for ISR access in event_handler)
+static bool esb_pairing = false;
+static bool esb_paired = false;
+static bool esb_clearing = false;
+
+// Pairing timeout and target count
+static int64_t pairing_start_time = 0;
+static uint8_t pairing_target_count = 0; // 0 = no limit, >0 = exit after N new devices
+static uint8_t pairing_initial_count = 0; // Number of devices when pairing started
+static int64_t pairing_target_reached_time = 0; // Time when target count was reached (for delayed exit)
+static volatile bool pairing_new_devices_blocked = false; // When true, only allow re-pairing of known devices
+#define PAIRING_EXIT_DELAY_MS 15000 // Delay before exiting after target count reached
+
+// Cached receiver device address (set once at init, used by ISR for pairing responses)
+static uint8_t receiver_device_addr[6] = {0};
+
+// NVS async write infrastructure
+struct nvs_write_request {
+	uint16_t id;
+	uint8_t len;
+	uint8_t data[8]; // large enough for uint64_t
+};
+
+K_MSGQ_DEFINE(nvs_write_msgq, sizeof(struct nvs_write_request), 20, 4);
+
+static void nvs_writer_thread(void);
 
 // Packet statistics structure
 struct packet_stats {
@@ -111,12 +127,20 @@ struct packet_stats {
 	uint32_t packets_in_last_second; // Number of packets in the last second
 	uint64_t last_tps_time;          // Last TPS calculation timestamp
 	uint32_t current_tps;            // Current TPS (packets per second)
+	// Per-status-period counters (filled into status packet data[4]/data[5], reset after each status packet)
+	uint16_t status_received; // Packets received since last status packet
+	uint16_t status_lost;     // Packets lost (gaps) since last status packet
 };
 
 static struct packet_stats tracker_stats[MAX_TRACKERS] = {0};
-#define STATS_PRINT_INTERVAL_MS 5000     // Print statistics every 5 seconds
+#define STATS_PRINT_INTERVAL_MS 1000     // Print detailed statistics every 1 second (when enabled)
 #define TPS_CALCULATION_INTERVAL_MS 1000 // Calculate TPS every second
 #define TPS_MONITOR_INTERVAL_MS 500
+
+// Statistics display control
+static volatile bool stats_detailed_enabled = false;        // Whether detailed stats are enabled
+static volatile int64_t stats_detailed_end_time = 0;        // Timestamp when detailed stats should auto-disable (0 = no auto-disable)
+static int64_t last_tps_print_time = 0;                     // Last time total TPS was printed
 
 // TDMA Statistics
 struct tdma_stats {
@@ -138,8 +162,39 @@ LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 
 static void esb_thread(void);
 K_THREAD_DEFINE(esb_thread_id, 1024, esb_thread, NULL, NULL, NULL, 7, 0, 0);
+K_THREAD_DEFINE(nvs_writer_thread_id, 1024, nvs_writer_thread, NULL, NULL, NULL, 9, 0, 0);
 
 static bool esb_parse_pair(const uint8_t packet[8]);
+static void process_pairing_queue(void);
+
+// Find tracker by address without locks.
+// On single-core ARM Cortex-M, compiler barrier ensures correct ordering.
+// stored_tracker_addr[] is append-only from ISR perspective — thread writes
+// the address first, then increments count with a compiler barrier in between.
+static inline int esb_find_tracker(uint64_t addr)
+{
+	if (addr == 0) {
+		return -1;
+	}
+	uint8_t count = stored_trackers; // single atomic byte read on ARM
+	__asm__ volatile("" ::: "memory"); // compiler barrier: ensure count is read before array
+	for (int i = 0; i < count && i < MAX_TRACKERS; i++) {
+		if (stored_tracker_addr[i] == addr) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+// Queue an NVS write for async processing (thread-safe, non-blocking)
+static inline void nvs_write_async(uint16_t id, const void *data, size_t len)
+{
+	struct nvs_write_request req = {.id = id, .len = (uint8_t)MIN(len, sizeof(req.data))};
+	memcpy(req.data, data, req.len);
+	if (k_msgq_put(&nvs_write_msgq, &req, K_NO_WAIT) != 0) {
+		LOG_WRN("NVS write queue full, dropping write for id %u", id);
+	}
+}
 
 static int check_packet_sequence(uint8_t tracker_id, uint8_t received_seq)
 {
@@ -173,6 +228,7 @@ static int check_packet_sequence(uint8_t tracker_id, uint8_t received_seq)
 		stats->normal_packets++;
 		stats->last_sequence = received_seq;
 		stats->first_packet = false;
+		stats->status_received++;
 		LOG_DBG("First packet: tracker=%d, seq=%d", tracker_id, received_seq);
 		return 0;
 	}
@@ -195,6 +251,7 @@ static int check_packet_sequence(uint8_t tracker_id, uint8_t received_seq)
 		packet_count[tracker_id]++;
 		stats->normal_packets++;
 		stats->last_sequence = received_seq;
+		stats->status_received++;
 		LOG_DBG("Normal packet: tracker=%d, seq=%d", tracker_id, received_seq);
 		return 0;
 	}
@@ -236,6 +293,7 @@ static int check_packet_sequence(uint8_t tracker_id, uint8_t received_seq)
 		last_packet_sequence[tracker_id] = received_seq;
 		packet_count[tracker_id]++;
 		stats->last_sequence = received_seq;
+		stats->status_received++;
 		// Restart events are kept at WARNING level because this is important information
 		LOG_WRN(
 			"Tracker restart detected: tracker=%d, last_seq=%d, new_seq=%d, jump=%d",
@@ -251,7 +309,10 @@ static int check_packet_sequence(uint8_t tracker_id, uint8_t received_seq)
 	if (diff_forward > 0 && diff_forward <= 80) {
 		stats->total_received++;
 		stats->gap_events++;
-		stats->total_gaps += (diff_forward - 1); // Estimate number of lost packets
+		uint8_t gaps = diff_forward - 1;
+		stats->total_gaps += gaps; // Estimate number of lost packets
+		stats->status_received++;
+		stats->status_lost += gaps;
 		last_packet_sequence[tracker_id] = received_seq;
 		packet_count[tracker_id]++;
 		stats->last_sequence = received_seq;
@@ -260,7 +321,7 @@ static int check_packet_sequence(uint8_t tracker_id, uint8_t received_seq)
 			"Gap detected: tracker=%d, seq=%d, gap=%d (forward=%d)",
 			tracker_id,
 			received_seq,
-			diff_forward - 1,
+			gaps,
 			diff_forward
 		);
 		return 1;
@@ -331,12 +392,14 @@ static void print_tracker_stats_batch(void)
 
 static void esb_stats_thread(void)
 {
-	int64_t last_log_time = k_uptime_get();
+	last_tps_print_time = k_uptime_get();
 
 	while (1) {
 		k_msleep(TPS_MONITOR_INTERVAL_MS);
 
 		uint64_t now = (uint64_t)k_uptime_get();
+
+		// Update TPS for each tracker
 		for (int i = 0; i < MAX_TRACKERS; i++) {
 			struct packet_stats *stats = &tracker_stats[i];
 			if (stats->last_tps_time == 0) {
@@ -353,68 +416,178 @@ static void esb_stats_thread(void)
 			}
 		}
 
-		if (now - last_log_time >= STATS_PRINT_INTERVAL_MS) {
-			bool has_data = false;
+		// Check if detailed stats should be auto-disabled
+		if (stats_detailed_enabled && stats_detailed_end_time > 0) {
+			if (now >= stats_detailed_end_time) {
+				stats_detailed_enabled = false;
+				stats_detailed_end_time = 0;
+				LOG_INF("Detailed stats auto-disabled");
+			}
+		}
+
+		// Print total TPS every second (always)
+		if (now - last_tps_print_time >= TPS_CALCULATION_INTERVAL_MS) {
+			uint32_t total_tps = 0;
 			for (int i = 0; i < MAX_TRACKERS; i++) {
-				if (tracker_stats[i].total_received > 0) {
-					has_data = true;
-					break;
-				}
+				total_tps += tracker_stats[i].current_tps;
+			}
+			LOG_INF("Total TPS: %u", total_tps);
+			last_tps_print_time = now;
+		}
+
+		// Print detailed stats only when enabled
+		if (stats_detailed_enabled) {
+			static int64_t last_detailed_log_time = 0;
+			if (last_detailed_log_time == 0) {
+				last_detailed_log_time = now;
 			}
 
-			if (has_data) {
-				LOG_INF("=== Packet Statistics ===");
-				print_tracker_stats_batch();
+			if (now - last_detailed_log_time >= STATS_PRINT_INTERVAL_MS) {
+				bool has_data = false;
+				for (int i = 0; i < MAX_TRACKERS; i++) {
+					if (tracker_stats[i].total_received > 0) {
+						has_data = true;
+						break;
+					}
+				}
+
+				if (has_data) {
+					LOG_INF("=== Packet Statistics ===");
+					print_tracker_stats_batch();
+				}
+				last_detailed_log_time = now;
 			}
-			last_log_time = now;
 		}
 	}
 }
 
+/* ---------------------------------------------------------------------------
+ * ACK handler — runs in radio ISR context (~130 µs budget).
+ * Builds the ACK payload for the *current* packet so the response is
+ * returned in the same transaction rather than the next one.
+ *
+ * Only reads pre-computed volatile state written by event_handler / threads.
+ * No blocking, no logging, no locks.
+ * -------------------------------------------------------------------------*/
+static void esb_ack_handler_cb(const uint8_t *pdu_data, uint8_t data_length,
+				uint32_t pipe_id, struct esb_payload *ack_payload,
+				bool *has_ack_payload)
+{
+	/* ---- PING → PONG (immediate response) ---- */
+	if (data_length == ESB_PING_LEN && pdu_data[0] == ESB_PING_TYPE) {
+		uint8_t tracker_id = pdu_data[1];
+		if (tracker_id >= MAX_TRACKERS) {
+			return;
+		}
+
+		uint8_t crc = crc8_ccitt(0x07, pdu_data, ESB_PING_LEN - 1);
+		if (pdu_data[ESB_PING_LEN - 1] != crc) {
+			return;
+		}
+
+		uint32_t rx_ticks = k_uptime_ticks();
+		uint8_t counter = pdu_data[2];
+		uint8_t cmd = tracker_remote_command[tracker_id];
+
+		ack_payload->pipe = 1 + (tracker_id % 7);
+		ack_payload->length = ESB_PONG_LEN;
+		ack_payload->noack = false;
+
+		ack_payload->data[0] = ESB_PONG_TYPE;
+		ack_payload->data[1] = tracker_id;
+		ack_payload->data[2] = counter;
+		ack_payload->data[7] = cmd;
+
+		if (cmd == ESB_PONG_FLAG_SENS_SET) {
+			/* SENS_SET overrides time sync bytes with sensitivity data */
+			int16_t s0 = pending_sens_data[tracker_id][0];
+			int16_t s1 = pending_sens_data[tracker_id][1];
+			int16_t s2 = pending_sens_data[tracker_id][2];
+			ack_payload->data[3] = (s0 >> 8) & 0xFF;
+			ack_payload->data[4] = (s0) & 0xFF;
+			ack_payload->data[5] = (s1 >> 8) & 0xFF;
+			ack_payload->data[6] = (s1) & 0xFF;
+			ack_payload->data[8] = (s2 >> 8) & 0xFF;
+			ack_payload->data[9] = (s2) & 0xFF;
+			ack_payload->data[10] = 0;
+			ack_payload->data[11] = 0;
+		} else {
+			/* Normal: embed receiver timestamp for time sync */
+			ack_payload->data[3] = (rx_ticks >> 24) & 0xFF;
+			ack_payload->data[4] = (rx_ticks >> 16) & 0xFF;
+			ack_payload->data[5] = (rx_ticks >> 8) & 0xFF;
+			ack_payload->data[6] = (rx_ticks) & 0xFF;
+
+			if (cmd == ESB_PONG_FLAG_SET_CHANNEL) {
+				uint32_t ch = tracker_channel_value;
+				ack_payload->data[8] = (ch >> 24) & 0xFF;
+				ack_payload->data[9] = (ch >> 16) & 0xFF;
+				ack_payload->data[10] = (ch >> 8) & 0xFF;
+				ack_payload->data[11] = (ch) & 0xFF;
+			} else if (cmd == ESB_PONG_FLAG_NORMAL) {
+				/* ticks_diff for clock skew compensation */
+				uint32_t est = ((uint32_t)pdu_data[3] << 24)
+					     | ((uint32_t)pdu_data[4] << 16)
+					     | ((uint32_t)pdu_data[5] << 8)
+					     | ((uint32_t)pdu_data[6]);
+				int32_t diff = (int32_t)(rx_ticks - est);
+				ack_payload->data[8] = (diff >> 24) & 0xFF;
+				ack_payload->data[9] = (diff >> 16) & 0xFF;
+				ack_payload->data[10] = (diff >> 8) & 0xFF;
+				ack_payload->data[11] = (diff) & 0xFF;
+			} else {
+				memset(&ack_payload->data[8], 0, 4);
+			}
+		}
+
+		ack_payload->data[ESB_PONG_LEN - 1] =
+			crc8_ccitt(0x07, ack_payload->data, ESB_PONG_LEN - 1);
+		*has_ack_payload = true;
+		return;
+	}
+
+	/* ---- Pairing response (on step 1, when tracker expects ACK) ---- */
+	if (data_length == 8 && pdu_data[1] == 1) {
+		uint64_t raw_addr = 0;
+
+		memcpy(&raw_addr, pdu_data, sizeof(raw_addr));
+		uint64_t found_addr = (raw_addr >> 16) & 0xFFFFFFFFFFFFULL;
+		uint8_t checksum = crc8_ccitt(0x07, &pdu_data[2], 6);
+		if (checksum == 0) {
+			checksum = 8;
+		}
+		if (checksum != pdu_data[0] || found_addr == 0) {
+			return;
+		}
+
+		int known_id = esb_find_tracker(found_addr);
+		if (known_id < 0 || !esb_pairing) {
+			return;
+		}
+
+		ack_payload->pipe = pipe_id;
+		ack_payload->length = 8;
+		ack_payload->noack = false;
+		ack_payload->data[0] = checksum;
+		ack_payload->data[1] = (uint8_t)known_id;
+		memcpy(&ack_payload->data[2], receiver_device_addr, 6);
+		*has_ack_payload = true;
+		return;
+	}
+
+	/* Other packet types: no ACK payload, handled by event_handler */
+}
+
 void event_handler(struct esb_evt const *event)
 {
-	int64_t now = k_uptime_get();
-
 	switch (event->evt_id) {
 	case ESB_EVENT_TX_SUCCESS:
-		tx_statistics.total_success++;
-		tx_statistics.success_since_last_log++;
-		tx_statistics.consecutive_fails = 0; // Reset consecutive fail counter
-
+		// TX success - no action needed
 		break;
 
 	case ESB_EVENT_TX_FAILED:
-		tx_statistics.total_failed++;
-		tx_statistics.failed_since_last_log++;
-		tx_statistics.consecutive_fails++;
-		tx_statistics.last_fail_time = now;
-		// Only output detailed logs when there are many consecutive failures
-		if (tx_statistics.consecutive_fails <= 3) {
-			// Low frequency failures - DEBUG level
-			LOG_DBG("TX FAILED (attempts=%u, consecutive=%u)", event->tx_attempts, tx_statistics.consecutive_fails);
-		} else if (tx_statistics.consecutive_fails <= 10) {
-			// Medium frequency failures - log every 5 times
-			if (tx_statistics.consecutive_fails % 5 == 0) {
-				LOG_WRN(
-					"TX FAILED repeatedly! (consecutive=%u, attempts=%u)",
-					tx_statistics.consecutive_fails,
-					event->tx_attempts
-				);
-			}
-		} else {
-			// High frequency failures - log every 10 times
-			if (tx_statistics.consecutive_fails % 10 == 0) {
-				LOG_ERR("TX CRITICAL: %u consecutive failures! Check RF environment", tx_statistics.consecutive_fails);
-			}
-
-			// Recovery mechanism
-			if (tx_statistics.consecutive_fails >= 50) {
-				LOG_ERR("Too many TX failures, attempting ESB recovery...");
-				esb_flush_tx();
-				k_msleep(10);
-				tx_statistics.consecutive_fails = 0; // Reset to avoid spam
-			}
-		}
+		// TX failed - log at debug level
+		LOG_DBG("TX FAILED (attempts=%u)", event->tx_attempts);
 		break;
 	case ESB_EVENT_RX_RECEIVED: {
 		int err = 0;
@@ -432,34 +605,74 @@ void event_handler(struct esb_evt const *event)
 			case 1: // ACK packet
 				LOG_DBG("RX ACK len=%u pipe=%u data=%02X", rx_payload.length, rx_payload.pipe, rx_payload.data[0]);
 				break;
-			case 8: {
-				struct pairing_event evt = {0};
-				memcpy(evt.packet, rx_payload.data, sizeof(evt.packet));
-				LOG_DBG("rx: %16llX", *(uint64_t *)evt.packet);
-				int q_err = k_msgq_put(&esb_pairing_msgq, &evt, K_NO_WAIT);
-				if (q_err) {
-					struct pairing_event discarded;
-					if (k_msgq_get(&esb_pairing_msgq, &discarded, K_NO_WAIT) == 0) {
-						q_err = k_msgq_put(&esb_pairing_msgq, &evt, K_NO_WAIT);
+			case 8: { // Pairing packet (unified handler)
+				uint8_t step = rx_payload.data[1];
+				LOG_DBG("RX pairing pkt step=%u pipe=%u", step, rx_payload.pipe);
+
+				if (step == 0) {
+					// Step 0: Pairing request - handle known devices directly in ISR
+					uint64_t raw_addr = 0;
+					memcpy(&raw_addr, rx_payload.data, sizeof(raw_addr));
+					uint64_t found_addr = (raw_addr >> 16) & 0xFFFFFFFFFFFF;
+					uint8_t checksum = crc8_ccitt(0x07, &rx_payload.data[2], 6);
+					if (checksum == 0) {
+						checksum = 8;
 					}
-					if (q_err) {
-						LOG_WRN("ACK queue full, dropping packet type %u", evt.packet[1]);
+
+					if (checksum != rx_payload.data[0] || found_addr == 0) {
+						LOG_WRN("Invalid pairing checksum or address");
+						break;
 					}
-				}
-				switch (evt.packet[1]) {
-				case 1: // receives ack generated from last packet
-					LOG_DBG("RX Pairing Sent ACK");
-					break;
-				case 2: // should "acknowledge" pairing data sent from
-						// receiver
-					LOG_DBG("RX Pairing ACK Receiver");
-					break;
-				case 0:
-					LOG_INF("RX Pairing Request");
-					break;
-				default:
-					LOG_WRN("Unexpected pairing packet type %u", evt.packet[1]);
-					break;
+
+					// ISR-safe lockless lookup of known devices
+					int known_id = esb_find_tracker(found_addr);
+
+					if (!esb_pairing) {
+						if (known_id >= 0) {
+							LOG_WRN(
+								"Received pairing request from known tracker %d, but pairing mode inactive",
+								known_id
+							);
+						} else {
+							LOG_INF("Pairing request from unknown %012llX, pairing mode inactive", found_addr);
+						}
+						break;
+					}
+
+					// Check if new devices are blocked (target count reached, waiting for exit delay)
+					if (pairing_new_devices_blocked && known_id < 0) {
+						LOG_INF("Pairing request from unknown %012llX rejected (target count reached)", found_addr);
+						break;
+					}
+
+					if (known_id >= 0) {
+						// Known device: ack_handler will respond on step 1.
+						LOG_INF("Known tracker %d re-pairing (ack_handler responds on step 1)", known_id);
+					} else {
+						// Unknown device + pairing mode: queue for thread processing
+						struct pairing_event evt = {0};
+						memcpy(evt.packet, rx_payload.data, sizeof(evt.packet));
+
+						int q_err = k_msgq_put(&esb_pairing_msgq, &evt, K_NO_WAIT);
+						if (q_err) {
+							// Drop one and retry
+							struct pairing_event discarded;
+							(void)k_msgq_get(&esb_pairing_msgq, &discarded, K_NO_WAIT);
+							q_err = k_msgq_put(&esb_pairing_msgq, &evt, K_NO_WAIT);
+						}
+
+						if (q_err) {
+							LOG_WRN("Pairing queue full, dropping request from %012llX", found_addr);
+						} else {
+							LOG_INF("New device %012llX pairing request queued", found_addr);
+						}
+					}
+				} else if (step == 1) {
+					LOG_DBG("RX Pairing Sent ACK (step 1)");
+				} else if (step == 2) {
+					LOG_DBG("RX Pairing Confirm (step 2)");
+				} else {
+					LOG_WRN("Unexpected pairing packet type %u", step);
 				}
 				break;
 			} break;
@@ -486,7 +699,9 @@ void event_handler(struct esb_evt const *event)
 					int32_t rx_time_diff_ticks = (int32_t)(current_rx_ticks - expected_rx_ticks);
 					uint64_t rx_time_diff_us
 						= k_ticks_to_us_floor64((rx_time_diff_ticks < 0 ? -rx_time_diff_ticks : rx_time_diff_ticks));
-
+#if !TDMA_ENABLED
+					ARG_UNUSED(rx_time_diff_us);
+#endif
 					// Log periodically
 					int64_t now_ms = k_uptime_get();
 					if (stats->count > 0) {
@@ -767,78 +982,26 @@ void event_handler(struct esb_evt const *event)
 
 							if ((ping_ack_flag == ESB_PONG_FLAG_SET_CHANNEL
 								 || ping_ack_flag == ESB_PONG_FLAG_CLEAR_CHANNEL)
-								&& channel_change_pending) {
-								atomic_or(&channel_ack_mask, (1 << tracker_id));
-								uint8_t current_mask = atomic_get(&channel_ack_mask);
+								&& atomic_get(&channel_change_pending)) {
+								// Use the return value (old mask) of atomic_or to compute
+								// the new mask locally, avoiding a separate atomic_get that
+								// could race with other trackers confirming concurrently.
+								atomic_val_t old_mask = atomic_or(&channel_ack_mask, (1 << tracker_id));
+								atomic_val_t new_mask = old_mask | (1 << tracker_id);
 								LOG_INF(
 									"Tracker %u confirmed channel change "
 									"(%u/%u confirmed)",
 									tracker_id,
-									__builtin_popcount(current_mask),
+									__builtin_popcount(new_mask),
 									stored_trackers
 								);
 							}
 						}
 					}
 
-					struct esb_payload pong = {.noack = false, .pipe = 1 + (tracker_id % 7), .length = ESB_PONG_LEN};
-
-					pong.data[0] = ESB_PONG_TYPE;
-					pong.data[1] = tracker_id;
-					pong.data[2] = counter;
-					pong.data[3] = (current_rx_ticks >> 24) & 0xFF;
-					pong.data[4] = (current_rx_ticks >> 16) & 0xFF;
-					pong.data[5] = (current_rx_ticks >> 8) & 0xFF;
-					pong.data[6] = (current_rx_ticks) & 0xFF;
-					pong.data[7] = tracker_remote_command[tracker_id];
-
-					// Fill data[8-11] based on command type
-					if (tracker_remote_command[tracker_id] == ESB_PONG_FLAG_SET_CHANNEL) {
-						// For SET_CHANNEL, use the channel value
-						pong.data[8] = (tracker_channel_value >> 24) & 0xFF;
-						pong.data[9] = (tracker_channel_value >> 16) & 0xFF;
-						pong.data[10] = (tracker_channel_value >> 8) & 0xFF;
-						pong.data[11] = (tracker_channel_value) & 0xFF;
-					} else if (tracker_remote_command[tracker_id] == ESB_PONG_FLAG_SENS_SET) {
-						// For SENS_SET, use compressed sensitivity data
-						// Overwrite time sync bytes (3-6) and use bytes 8-9
-						pong.data[3] = (pending_sens_data[tracker_id][0] >> 8) & 0xFF;
-						pong.data[4] = (pending_sens_data[tracker_id][0]) & 0xFF;
-						pong.data[5] = (pending_sens_data[tracker_id][1] >> 8) & 0xFF;
-						pong.data[6] = (pending_sens_data[tracker_id][1]) & 0xFF;
-
-						pong.data[8] = (pending_sens_data[tracker_id][2] >> 8) & 0xFF;
-						pong.data[9] = (pending_sens_data[tracker_id][2]) & 0xFF;
-						pong.data[10] = 0; // Unused
-						pong.data[11] = 0; // Unused
-					} else if (tracker_remote_command[tracker_id] == ESB_PONG_FLAG_NORMAL) {
-						// Send ticks_diff for clock skew compensation
-						pong.data[8] = (ticks_diff >> 24) & 0xFF;
-						pong.data[9] = (ticks_diff >> 16) & 0xFF;
-						pong.data[10] = (ticks_diff >> 8) & 0xFF;
-						pong.data[11] = (ticks_diff) & 0xFF;
-					} else {
-						// For other commands, currently unused
-						memset(&pong.data[8], 0x00, 4); // reserved
-					}
-
-					// Try to write ACK payload with robust error handling
-					pong.data[ESB_PONG_LEN - 1] = crc8_ccitt(0x07, pong.data, ESB_PONG_LEN - 1);
-					esb_flush_tx();
-					int werr = esb_write_payload(&pong);
-
-					if (werr == 0) {
-						// Success - mark this counter as queued
-						last_pong_queued_counter[tracker_id] = counter;
-						LOG_DBG(
-							"ACK payload queued: PONG id=%u ctr=%u pipe=%u "
-							"cmd=0x%02X",
-							tracker_id,
-							counter,
-							pong.pipe,
-							tracker_remote_command[tracker_id]
-						);
-					}
+					/* PONG is now built by ack_handler in radio ISR context.
+					 * event_handler only needs to track sequence state. */
+					last_pong_queued_counter[tracker_id] = counter;
 				}
 			} break;
 			case 17: // 16 bytes data + 1 byte sequence number
@@ -901,6 +1064,16 @@ void event_handler(struct esb_evt const *event)
 				}
 
 				// Forward packet for other cases (normal, potential loss, reboot)
+				// For status packets (type 3), fill in packet loss statistics before forwarding
+				if (rx_payload.data[0] == 3) {
+					struct packet_stats *stats = &tracker_stats[tracker_id];
+					rx_payload.data[4] = stats->status_received;
+					rx_payload.data[5] = stats->status_lost;
+					rx_payload.data[6] = 0; // windows_hit (not implemented)
+					rx_payload.data[7] = 0; // windows_missed (not implemented)
+					stats->status_received = 0;
+					stats->status_lost = 0;
+				}
 				hid_write_packet_n(rx_payload.data,
 								   rx_payload.rssi); // write to hid endpoint
 			} break;
@@ -996,11 +1169,12 @@ int esb_initialize(bool tx)
 		config.tx_mode = ESB_TXMODE_MANUAL;
 		// config.payload_length = 32;
 		config.selective_auto_ack = true;
-		// config.use_fast_ramp_up = true;
+		config.use_fast_ramp_up = true;
 	} else {
 		config.protocol = ESB_PROTOCOL_ESB_DPL;
 		config.mode = ESB_MODE_PRX;
 		config.event_handler = event_handler;
+		config.ack_handler = esb_ack_handler_cb;
 		// config.bitrate = ESB_BITRATE_2MBPS;
 		// config.crc = ESB_CRC_16BIT;
 		config.tx_output_power = CONFIG_RADIO_TX_POWER;
@@ -1009,7 +1183,7 @@ int esb_initialize(bool tx)
 		// config.tx_mode = ESB_TXMODE_MANUAL;
 		// config.payload_length = 32;
 		config.selective_auto_ack = true;
-		// config.use_fast_ramp_up = true;
+		config.use_fast_ramp_up = true;
 	}
 
 	LOG_INF("Initializing ESB, %sX mode", tx ? "T" : "R");
@@ -1093,9 +1267,38 @@ inline void esb_set_addr_paired(void)
 	memcpy(addr_prefix, addr_buffer + 8, sizeof(addr_prefix));
 }
 
-static bool esb_pairing = false;
-static bool esb_paired = false;
-static bool esb_clearing = false;
+// Unified mode: pipe 0 uses discovery address (pairing), pipes 1-7 use paired address (data)
+void esb_set_addr_unified(void)
+{
+	// Pipe 0: discovery base address for pairing
+	memcpy(base_addr_0, discovery_base_addr_0, sizeof(base_addr_0));
+
+	// Pipes 1-7: paired base address for data/PING
+	uint64_t *addr = (uint64_t *)NRF_FICR->DEVICEADDR;
+	uint8_t buf[6] = {0};
+	memcpy(buf, addr, 6);
+	uint8_t addr_buffer[16] = {0};
+	for (int i = 0; i < 4; i++) {
+		addr_buffer[i] = buf[i];
+		addr_buffer[i + 4] = buf[i] + buf[4];
+	}
+	for (int i = 0; i < 8; i++) {
+		addr_buffer[i + 8] = buf[5] + i;
+	}
+	for (int i = 0; i < 16; i++) {
+		if (addr_buffer[i] == 0x00 || addr_buffer[i] == 0x55
+			|| addr_buffer[i] == 0xAA) { // Avoid invalid addresses (see nrf datasheet)
+			addr_buffer[i] += 8;
+		}
+	}
+	memcpy(base_addr_1, addr_buffer + 4, sizeof(base_addr_1));
+
+	// Prefix: pipe 0 = discovery, pipes 1-7 = paired
+	addr_prefix[0] = discovery_addr_prefix[0];
+	for (int i = 1; i < 8; i++) {
+		addr_prefix[i] = addr_buffer[8 + i];
+	}
+}
 
 int esb_add_pair(uint64_t addr, bool checksum)
 {
@@ -1121,8 +1324,11 @@ int esb_add_pair(uint64_t addr, bool checksum)
 			return -ENOSPC;
 		}
 		assigned_id = stored_trackers;
+		// Write addr first, then barrier, then increment count
+		// This ensures ISR lockless reads see consistent data
 		stored_tracker_addr[assigned_id] = addr;
-		stored_trackers++;
+		__asm__ volatile("" ::: "memory"); // compiler barrier
+		stored_trackers = assigned_id + 1;
 		new_entry = true;
 	}
 
@@ -1130,8 +1336,10 @@ int esb_add_pair(uint64_t addr, bool checksum)
 
 	if (new_entry) {
 		LOG_INF("Added device on id %d with address %012llX", assigned_id, addr);
-		sys_write(STORED_ADDR_0 + assigned_id, NULL, &stored_tracker_addr[assigned_id], sizeof(stored_tracker_addr[0]));
-		sys_write(STORED_TRACKERS, NULL, &stored_trackers, sizeof(stored_trackers));
+		// Async NVS writes (non-blocking)
+		nvs_write_async(STORED_ADDR_0 + assigned_id, &stored_tracker_addr[assigned_id], sizeof(stored_tracker_addr[0]));
+		uint8_t count = stored_trackers;
+		nvs_write_async(STORED_TRACKERS, &count, sizeof(count));
 	} else {
 		LOG_INF("Device already stored with id %d", assigned_id);
 	}
@@ -1161,16 +1369,21 @@ void esb_pop_pair(void)
 
 	k_mutex_lock(&tracker_store_lock, K_FOREVER);
 	if (stored_trackers > 0) {
-		stored_trackers--;
-		removed_id = stored_trackers;
+		removed_id = stored_trackers - 1;
 		removed_addr = stored_tracker_addr[removed_id];
+		// Zero entry first, then barrier, then decrement count
+		// This ensures ISR lockless reads never match a removed entry
 		stored_tracker_addr[removed_id] = 0;
+		__asm__ volatile("" ::: "memory"); // compiler barrier
+		stored_trackers = (uint8_t)removed_id;
 	}
 	k_mutex_unlock(&tracker_store_lock);
 
 	if (removed_id >= 0) {
-		sys_write(STORED_TRACKERS, NULL, &stored_trackers, sizeof(stored_trackers));
-		sys_write(STORED_ADDR_0 + removed_id, NULL, &stored_tracker_addr[removed_id], sizeof(stored_tracker_addr[0]));
+		uint8_t count = stored_trackers;
+		nvs_write_async(STORED_TRACKERS, &count, sizeof(count));
+		uint64_t zero_addr = 0;
+		nvs_write_async(STORED_ADDR_0 + removed_id, &zero_addr, sizeof(zero_addr));
 		LOG_INF("Removed device on id %d with address %012llX", removed_id, removed_addr);
 	} else {
 		LOG_WRN("No devices to remove");
@@ -1228,110 +1441,92 @@ static bool esb_parse_pair(const uint8_t packet[8])
 
 void esb_start_pairing(void)
 {
-	LOG_INF("Starting pairing mode (non-blocking)");
-	esb_set_addr_discovery();
-	esb_initialize(false);
-	esb_start_rx();
-	tx_payload_pair.noack = false;
-	uint64_t *addr = (uint64_t *)NRF_FICR->DEVICEADDR;
-	memcpy(&tx_payload_pair.data[2], addr, 6);
-	LOG_INF("Device address: %012llX", *addr & 0xFFFFFFFFFFFF);
-	set_led(SYS_LED_PATTERN_SHORT, SYS_LED_PRIORITY_CONNECTION);
+	LOG_INF("Pairing mode enabled (unified)");
 	esb_pairing = true;
+	pairing_start_time = k_uptime_get();
+	pairing_target_count = 0; // No limit
+	pairing_initial_count = stored_trackers;
 	k_msgq_purge(&esb_pairing_msgq);
+	set_led(SYS_LED_PATTERN_SHORT, SYS_LED_PRIORITY_CONNECTION);
 }
 
-void esb_pair(void)
+void esb_start_pairing_with_count(uint8_t target_count)
 {
-	LOG_INF("Pairing");
-	esb_set_addr_discovery();
-	esb_initialize(false);
-	esb_start_rx();
-	tx_payload_pair.noack = false;
-	uint64_t *addr = (uint64_t *)NRF_FICR->DEVICEADDR; // Use device address as unique identifier (although it is
-													   // not actually guaranteed, see datasheet)
-	memcpy(&tx_payload_pair.data[2], addr, 6);
-	LOG_INF("Device address: %012llX", *addr & 0xFFFFFFFFFFFF);
-	set_led(SYS_LED_PATTERN_SHORT, SYS_LED_PRIORITY_CONNECTION);
+	LOG_INF("Pairing mode enabled (unified), target count: %u", target_count);
 	esb_pairing = true;
+	pairing_start_time = k_uptime_get();
+	pairing_target_count = target_count;
+	pairing_initial_count = stored_trackers;
 	k_msgq_purge(&esb_pairing_msgq);
-	while (esb_pairing) {
-		if (!esb_initialized) {
-			esb_initialize(false);
-			esb_start_rx();
+	set_led(SYS_LED_PATTERN_SHORT, SYS_LED_PRIORITY_CONNECTION);
+}
+
+// Process new device pairing requests from the queue (called from esb_thread, non-blocking)
+static void process_pairing_queue(void)
+{
+	struct pairing_event evt;
+	while (k_msgq_get(&esb_pairing_msgq, &evt, K_NO_WAIT) == 0) {
+		if (evt.packet[1] != 0) {
+			continue; // Only process step 0 (pairing request)
 		}
 
-		struct pairing_event evt;
-		int q_err = k_msgq_get(&esb_pairing_msgq, &evt, K_MSEC(10));
-		if (q_err != 0) {
+		bool ack_ready = esb_parse_pair(evt.packet);
+		if (!ack_ready) {
+			LOG_DBG("Pairing request invalid, not queueing response");
 			continue;
 		}
 
-		switch (evt.packet[1]) {
-		case 0: {
-			bool ack_ready = esb_parse_pair(evt.packet);
-			if (!ack_ready) {
-				LOG_DBG("Pairing request invalid, not queueing response");
-				break;
-			}
-			int tx_err = esb_write_payload(&tx_payload_pair);
-			if (tx_err == -ENOSPC) {
-				esb_flush_tx();
-				tx_err = esb_write_payload(&tx_payload_pair);
-			}
-			if (tx_err) {
-				LOG_ERR("Failed to queue pairing response: %d", tx_err);
-			} else {
-				LOG_DBG("tx: %16llX", *(uint64_t *)tx_payload_pair.data);
-			}
-			break;
-		}
-		case 2:
-			esb_flush_tx();
-			break;
-		case 1:
-			// Tracker acknowledged previous response, nothing to do
-			break;
-		default:
-			LOG_WRN("Unhandled pairing packet type %u", evt.packet[1]);
-			break;
-		}
+		// Device is now registered — ack_handler will respond on the
+		// next pairing step 1 via esb_find_tracker() lookup.
+		LOG_INF("New device registered: id=%u, ack_handler will respond on next step 1",
+			tx_payload_pair.data[1]);
+		set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
 	}
-	set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_CONNECTION);
-	esb_deinitialize();
 }
 
 void esb_reset_pair(void)
 {
-	esb_deinitialize(); // make sure esb is off
-	esb_paired = false;
+	// In unified mode, just enable pairing (no ESB reinit needed)
+	esb_start_pairing();
 }
 
 void esb_finish_pair(void)
 {
 	esb_pairing = false;
+	pairing_start_time = 0;
+	pairing_target_count = 0;
+	pairing_initial_count = 0;
+	pairing_target_reached_time = 0;
+	pairing_new_devices_blocked = false;
 	k_msgq_purge(&esb_pairing_msgq);
+	set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_CONNECTION);
+	LOG_INF("Pairing mode disabled");
 }
 
 void esb_clear(void)
 {
 	esb_clearing = true;
 
+	// Disable pairing mode during clear
+	esb_pairing = false;
+	k_msgq_purge(&esb_pairing_msgq);
+
 	k_mutex_lock(&tracker_store_lock, K_FOREVER);
 	uint8_t previous_count = stored_trackers;
+	// Set count to 0 first — ISR immediately stops reading the array
 	stored_trackers = 0;
+	__asm__ volatile("" ::: "memory"); // compiler barrier
 	memset(stored_tracker_addr, 0, sizeof(stored_tracker_addr));
 	k_mutex_unlock(&tracker_store_lock);
 
-	sys_write(STORED_TRACKERS, NULL, &stored_trackers, sizeof(stored_trackers));
+	// Async NVS writes
+	uint8_t zero_count = 0;
+	nvs_write_async(STORED_TRACKERS, &zero_count, sizeof(zero_count));
 	for (uint8_t i = 0; i < previous_count && i < MAX_TRACKERS; i++) {
-		sys_write(STORED_ADDR_0 + i, NULL, &stored_tracker_addr[i], sizeof(stored_tracker_addr[0]));
+		uint64_t zero_addr = 0;
+		nvs_write_async(STORED_ADDR_0 + i, &zero_addr, sizeof(zero_addr));
 	}
 	LOG_INF("NVS Reset");
-
-	esb_reset_pair();
-
-	k_msleep(10);
 
 	// Reset packet sequence state for all trackers
 	for (int i = 0; i < MAX_TRACKERS; i++) {
@@ -1412,6 +1607,15 @@ void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag)
 		case ESB_PONG_FLAG_MAG_CLEAR:
 			cmd_name = "MAG_CLEAR";
 			break;
+		case ESB_PONG_FLAG_MAG_CAL:
+			cmd_name = "MAG_CAL";
+			break;
+		case ESB_PONG_FLAG_MAG_ON:
+			cmd_name = "MAG_ON";
+			break;
+		case ESB_PONG_FLAG_MAG_OFF:
+			cmd_name = "MAG_OFF";
+			break;
 		case ESB_PONG_FLAG_REBOOT:
 			cmd_name = "REBOOT";
 			break;
@@ -1444,6 +1648,12 @@ void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag)
 			break;
 		case ESB_PONG_FLAG_RESET_TCAL:
 			cmd_name = "RESET_TCAL";
+			break;
+		case ESB_PONG_FLAG_TCAL_ON:
+			cmd_name = "TCAL_ON";
+			break;
+		case ESB_PONG_FLAG_TCAL_OFF:
+			cmd_name = "TCAL_OFF";
 			break;
 		case ESB_PONG_FLAG_TCAL_AUTO_ON:
 			cmd_name = "TCAL_AUTO_ON";
@@ -1494,6 +1704,15 @@ void esb_send_remote_command_all(uint8_t command_flag)
 	case ESB_PONG_FLAG_MAG_CLEAR:
 		cmd_name = "MAG_CLEAR";
 		break;
+	case ESB_PONG_FLAG_MAG_CAL:
+		cmd_name = "MAG_CAL";
+		break;
+	case ESB_PONG_FLAG_MAG_ON:
+		cmd_name = "MAG_ON";
+		break;
+	case ESB_PONG_FLAG_MAG_OFF:
+		cmd_name = "MAG_OFF";
+		break;
 	case ESB_PONG_FLAG_REBOOT:
 		cmd_name = "REBOOT";
 		break;
@@ -1526,6 +1745,12 @@ void esb_send_remote_command_all(uint8_t command_flag)
 		break;
 	case ESB_PONG_FLAG_RESET_TCAL:
 		cmd_name = "RESET_TCAL";
+		break;
+	case ESB_PONG_FLAG_TCAL_ON:
+		cmd_name = "TCAL_ON";
+		break;
+	case ESB_PONG_FLAG_TCAL_OFF:
+		cmd_name = "TCAL_OFF";
 		break;
 	case ESB_PONG_FLAG_TCAL_AUTO_ON:
 		cmd_name = "TCAL_AUTO_ON";
@@ -1572,28 +1797,70 @@ void esb_reset_all_stats(void)
 		last_ping_counter[i] = 0;
 		last_pong_queued_counter[i] = 0;
 	}
-	memset(&tx_statistics, 0, sizeof(struct tx_stats));
-	LOG_INF("All packet statistics, ACK statistics, and TX statistics have been reset");
+	LOG_INF("All packet statistics have been reset");
+}
+
+// Toggle detailed statistics display on/off
+bool esb_toggle_stats_detailed(void)
+{
+	stats_detailed_enabled = !stats_detailed_enabled;
+	stats_detailed_end_time = 0; // No auto-disable when toggling manually
+	return stats_detailed_enabled;
+}
+
+// Enable detailed statistics display for a specified duration (0 = toggle on/off permanently)
+void esb_set_stats_detailed(uint32_t duration_seconds)
+{
+	if (duration_seconds == 0) {
+		// Toggle mode
+		stats_detailed_enabled = !stats_detailed_enabled;
+		stats_detailed_end_time = 0;
+	} else {
+		// Timed mode
+		stats_detailed_enabled = true;
+		stats_detailed_end_time = k_uptime_get() + (int64_t)duration_seconds * 1000;
+	}
+}
+
+// Get current detailed stats status
+bool esb_get_stats_detailed_enabled(void)
+{
+	return stats_detailed_enabled;
+}
+
+// Get remaining time for detailed stats (0 if disabled or no auto-disable)
+uint32_t esb_get_stats_detailed_remaining(void)
+{
+	if (!stats_detailed_enabled || stats_detailed_end_time == 0) {
+		return 0;
+	}
+	int64_t remaining = stats_detailed_end_time - k_uptime_get();
+	if (remaining <= 0) {
+		return 0;
+	}
+	return (uint32_t)(remaining / 1000);
 }
 
 // Sets the RF channel for all trackers
 void esb_set_all_trackers_channel(uint8_t channel)
 {
-	if (channel > 100) {
-		LOG_ERR("Invalid channel value: %u (must be 0-100)", channel);
+	if (channel < 1 || channel > 100) {
+		LOG_ERR("Invalid channel value: %u (must be 1-100)", channel);
 		return;
 	}
 
-	if (channel_change_pending) {
+	if (atomic_get(&channel_change_pending)) {
 		LOG_WRN("Channel change already in progress, please wait");
 		return;
 	}
 
 	tracker_channel_value = channel;
 	pending_channel = channel;
-	channel_change_pending = true;
-	atomic_set(&channel_ack_mask, 0);
 	channel_change_timeout = k_uptime_get() + CHANNEL_CHANGE_TIMEOUT_MS;
+	// Clear mask before setting the pending flag to avoid losing confirmations
+	// that arrive between the flag set and the mask clear.
+	atomic_set(&channel_ack_mask, 0);
+	atomic_set(&channel_change_pending, 1);
 
 	esb_send_remote_command_all(ESB_PONG_FLAG_SET_CHANNEL);
 	LOG_INF("RF channel %u command sent to all trackers, waiting for confirmation...", channel);
@@ -1602,15 +1869,17 @@ void esb_set_all_trackers_channel(uint8_t channel)
 // Clear RF channel settings for all trackers (restore to default)
 void esb_clear_all_trackers_channel(void)
 {
-	if (channel_change_pending) {
+	if (atomic_get(&channel_change_pending)) {
 		LOG_WRN("Channel change already in progress, please wait");
 		return;
 	}
 
 	pending_channel = 0xFF; // Special value to indicate clearing
-	channel_change_pending = true;
-	atomic_set(&channel_ack_mask, 0);
 	channel_change_timeout = k_uptime_get() + CHANNEL_CHANGE_TIMEOUT_MS;
+	// Clear mask before setting the pending flag to avoid losing confirmations
+	// that arrive between the flag set and the mask clear.
+	atomic_set(&channel_ack_mask, 0);
+	atomic_set(&channel_change_pending, 1);
 
 	esb_send_remote_command_all(ESB_PONG_FLAG_CLEAR_CHANNEL);
 	LOG_INF("CLEAR_CHANNEL command sent to all trackers, waiting for confirmation...");
@@ -1619,8 +1888,8 @@ void esb_clear_all_trackers_channel(void)
 // Set the receiver's RF channel (local, does not affect trackers)
 void esb_set_receiver_channel(uint8_t channel)
 {
-	if (channel > 100) {
-		LOG_ERR("Invalid channel value: %u (must be 0-100)", channel);
+	if (channel < 1 || channel > 100) {
+		LOG_ERR("Invalid channel value: %u (must be 1-100)", channel);
 		return;
 	}
 
@@ -1673,11 +1942,22 @@ void esb_write_sync(uint16_t led_clock)
 	esb_write_payload(&tx_payload_sync);
 }
 
-// TODO:
+// Set up unified addresses: pipe 0 for discovery (pairing), pipes 1-7 for paired data
 void esb_receive(void)
 {
-	esb_set_addr_paired();
+	esb_set_addr_unified();
 	esb_paired = true;
+}
+
+// NVS writer thread: processes async NVS write requests
+static void nvs_writer_thread(void)
+{
+	struct nvs_write_request req;
+	while (1) {
+		k_msgq_get(&nvs_write_msgq, &req, K_FOREVER);
+		k_msleep(5); // Simulate async write delay
+		sys_write(req.id, NULL, req.data, req.len);
+	}
 }
 
 static void esb_thread(void)
@@ -1714,24 +1994,70 @@ static void esb_thread(void)
 	}
 	LOG_INF("%d/%d devices stored", tracker_count, MAX_TRACKERS);
 
-	if (esb_paired) {
-		esb_receive();
-		esb_initialize(false);
-		esb_start_rx();
+	// Cache receiver device address for ISR pairing responses
+	uint64_t *dev_addr = (uint64_t *)NRF_FICR->DEVICEADDR;
+	memcpy(receiver_device_addr, dev_addr, 6);
+	LOG_INF("Receiver address: %012llX", *dev_addr & 0xFFFFFFFFFFFF);
+
+	// Pre-fill tx_payload_pair with receiver address (for thread-side pairing responses)
+	tx_payload_pair.pipe = 0;
+	tx_payload_pair.noack = false;
+	tx_payload_pair.length = 8;
+	memcpy(&tx_payload_pair.data[2], receiver_device_addr, 6);
+
+	// Always start in unified mode: pipe 0 for pairing, pipes 1-7 for data
+	esb_receive();
+	esb_initialize(false);
+	esb_start_rx();
+
+	// Auto-enable pairing mode if no stored trackers
+	if (tracker_count == 0) {
+		esb_pairing = true;
+		pairing_start_time = k_uptime_get();
+		pairing_target_count = 0;
+		pairing_initial_count = 0;
+		LOG_INF("No stored trackers, pairing mode auto-enabled");
+		set_led(SYS_LED_PATTERN_SHORT, SYS_LED_PRIORITY_CONNECTION);
 	}
 
 	while (1) {
-		if (!esb_paired && !esb_clearing) {
-			esb_pair();
-			esb_receive();
-			esb_initialize(false);
-			esb_start_rx();
+		// Process new device pairing requests (non-blocking)
+		if (esb_pairing) {
+			process_pairing_queue();
+
+			// Check for pairing timeout
+			if (PAIRING_TIMEOUT_SECONDS > 0 && pairing_start_time > 0) {
+				int64_t elapsed = k_uptime_get() - pairing_start_time;
+				if (elapsed >= (PAIRING_TIMEOUT_SECONDS * 1000)) {
+					LOG_INF("Pairing mode timeout (%d seconds), auto-exiting", PAIRING_TIMEOUT_SECONDS);
+					esb_finish_pair();
+				}
+			}
+
+			// Check for target count reached
+			if (pairing_target_count > 0) {
+				uint8_t new_devices = stored_trackers - pairing_initial_count;
+				if (new_devices >= pairing_target_count) {
+					// Mark when target was reached (only once)
+					if (pairing_target_reached_time == 0) {
+						pairing_target_reached_time = k_uptime_get();
+						pairing_new_devices_blocked = true; // Block new devices, allow re-pairing only
+						LOG_INF("Pairing target count reached (%u new devices), exiting in %d seconds...",
+							new_devices, PAIRING_EXIT_DELAY_MS / 1000);
+					}
+					// Check if delay has passed
+					int64_t elapsed_since_target = k_uptime_get() - pairing_target_reached_time;
+					if (elapsed_since_target >= PAIRING_EXIT_DELAY_MS) {
+						esb_finish_pair();
+					}
+				}
+			}
 		}
 
 		// Check if channel change is complete
-		if (channel_change_pending) {
-			uint8_t expected_mask = (1 << stored_trackers) - 1;
-			uint8_t current_mask = atomic_get(&channel_ack_mask);
+		if (atomic_get(&channel_change_pending)) {
+			uint32_t expected_mask = (stored_trackers < 32) ? ((1U << stored_trackers) - 1U) : 0xFFFFFFFFU;
+			uint32_t current_mask = (uint32_t)atomic_get(&channel_ack_mask);
 			int64_t now = k_uptime_get();
 
 			if (current_mask == expected_mask) {
@@ -1744,8 +2070,9 @@ static void esb_thread(void)
 					// Clear from NVS
 					sys_write(RF_CHANNEL, NULL, &receiver_rf_channel, sizeof(receiver_rf_channel));
 
-					// Reinitialize ESB with default channel
+					// Reinitialize ESB with default channel (unified addresses)
 					esb_deinitialize();
+					esb_set_addr_unified();
 					esb_initialize(false);
 					esb_start_rx();
 
@@ -1758,15 +2085,16 @@ static void esb_thread(void)
 					// Save to NVS
 					sys_write(RF_CHANNEL, NULL, &receiver_rf_channel, sizeof(receiver_rf_channel));
 
-					// Reinitialize ESB with new channel
+					// Reinitialize ESB with new channel (unified addresses)
 					esb_deinitialize();
+					esb_set_addr_unified();
 					esb_initialize(false);
 					esb_start_rx();
 
 					LOG_INF("Receiver channel switched to %u successfully", receiver_rf_channel);
 				}
 
-				channel_change_pending = false;
+				atomic_set(&channel_change_pending, 0);
 			} else if (now >= channel_change_timeout) {
 				// Timeout, cancel channel change
 				LOG_WRN(
@@ -1774,7 +2102,7 @@ static void esb_thread(void)
 					__builtin_popcount(current_mask),
 					stored_trackers
 				);
-				channel_change_pending = false;
+				atomic_set(&channel_change_pending, 0);
 				tracker_channel_value = 0; // Reset pending channel value
 			}
 		}
@@ -1782,3 +2110,4 @@ static void esb_thread(void)
 		k_msleep(100);
 	}
 }
+
