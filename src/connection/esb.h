@@ -58,6 +58,11 @@
 #define ESB_PONG_FLAG_FUSION_RESET 0x15  // Reset fusion (invalidate quaternion)
 #define ESB_PONG_FLAG_TCAL_BOOT_ON 0x16  // Enable T-Cal boot calibration
 #define ESB_PONG_FLAG_TCAL_BOOT_OFF 0x17 // Disable T-Cal boot calibration
+#define ESB_PONG_FLAG_MAG_CAL 0x18       // Trigger magnetometer calibration
+#define ESB_PONG_FLAG_MAG_ON 0x19        // Enable magnetometer
+#define ESB_PONG_FLAG_MAG_OFF 0x1A       // Disable magnetometer
+#define ESB_PONG_FLAG_TCAL_ON 0x1B       // Enable T-Cal (temperature calibration)
+#define ESB_PONG_FLAG_TCAL_OFF 0x1C      // Disable T-Cal (temperature calibration)
 
 void event_handler(struct esb_evt const *event);
 int clocks_start(void);
@@ -65,12 +70,13 @@ int esb_initialize(bool);
 
 void esb_set_addr_discovery(void);
 void esb_set_addr_paired(void);
+void esb_set_addr_unified(void);
 
 int esb_add_pair(uint64_t addr, bool checksum);
 void esb_pop_pair(void);
 
-void esb_pair(void);
 void esb_start_pairing(void);
+void esb_start_pairing_with_count(uint8_t target_count);
 void esb_reset_pair(void);
 void esb_finish_pair(void);
 void esb_clear(void);
@@ -79,6 +85,12 @@ void esb_print_all_stats(void);
 void esb_reset_all_stats(void);
 void esb_write_sync(uint16_t led_clock);
 void esb_receive(void);
+
+// Statistics display control
+bool esb_toggle_stats_detailed(void);           // Toggle detailed stats on/off
+void esb_set_stats_detailed(uint32_t duration_seconds); // Enable for duration (0 = toggle)
+bool esb_get_stats_detailed_enabled(void);      // Get current status
+uint32_t esb_get_stats_detailed_remaining(void); // Get remaining time (0 if no auto-disable)
 
 // Remote command API
 void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag);

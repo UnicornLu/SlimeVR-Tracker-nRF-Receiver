@@ -72,4 +72,13 @@ config RADIO_RETRANSMIT_DELAY
     help
         Radio retransmit delay.
 
+config PAIRING_TIMEOUT
+    int "Pairing mode timeout (seconds)"
+    default 300
+    help
+        Timeout for pairing mode in seconds.
+        After this time, pairing mode will automatically exit.
+        Default is 300 seconds (5 minutes).
+        Set to 0 to disable timeout.
+
 source "Kconfig.zephyr"

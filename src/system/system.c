@@ -43,10 +43,6 @@ K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, 6, 0, 0
 #define DFU_DBL_RESET_MEM 0x20007F7C
 #define DFU_DBL_RESET_APP 0x4ee5677e
 
-#if DFU_EXISTS
-static uint32_t *dbl_reset_mem = ((uint32_t *)DFU_DBL_RESET_MEM);
-#endif
-
 static bool nvs_init = false;
 
 static int sys_nvs_init(void) {

@@ -41,14 +41,14 @@
 	};
 
 	nrf_radio_fem: skyFem {
-        compatible = "skyworks,sky66112-11", "generic-fem-two-ctrl-pins";
-        ctx-gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
-        ctx-settle-time-us = <23>;
-        crx-gpios = <&gpio0 22 GPIO_ACTIVE_HIGH>;
-        crx-settle-time-us = <8>;
-        tx-gain-db = <22>;
+		compatible = "skyworks,sky66112-11", "generic-fem-two-ctrl-pins";
+		ctx-gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+		ctx-settle-time-us = <2>;
+		crx-gpios = <&gpio0 22 GPIO_ACTIVE_HIGH>;
+		crx-settle-time-us = <2>;
+		tx-gain-db = <22>;
 		rx-gain-db = <12>;
-    };
+	};
 
 	leds {
 		compatible = "gpio-leds";

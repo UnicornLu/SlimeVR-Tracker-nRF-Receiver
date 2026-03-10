@@ -27,6 +27,17 @@
 #define FW_VERSION_MINOR APP_VERSION_MINOR
 #define FW_VERSION_PATCH APP_PATCHLEVEL
 
+// Build-time VCS metadata (injected by CMake). Keep safe fallbacks for non-git builds.
+#ifndef FW_GIT_REPO_URL
+#define FW_GIT_REPO_URL "unknown"
+#endif
+#ifndef FW_GIT_BRANCH
+#define FW_GIT_BRANCH "unknown"
+#endif
+#ifndef FW_GIT_AUTHOR
+#define FW_GIT_AUTHOR "unknown"
+#endif
+
 // https://stackoverflow.com/questions/11697820/how-to-use-date-and-time-predefined-macros-in-as-two-integers-then-stri
 #define COMPUTE_BUILD_YEAR \
 	( \
