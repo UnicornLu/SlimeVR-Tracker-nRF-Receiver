@@ -33,6 +33,7 @@
 #include <zephyr/sys/reboot.h>
 #include <zephyr/logging/log_ctrl.h>
 #include "connection/esb.h"
+#include "connection/rssi_scan.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -168,12 +169,18 @@ static void print_help(void)
 	);
 
 	printk(
+		"RSSI / Channel Scan:\n"
+		"  rssi_scan                  Scan RSSI across channels 1-100 and print a recommended channel\n"
+		"\n"
+	);
+
+	printk(
 		"Remote Commands:\n"
 		"  send <id|all> <command>    Send remote command to tracker(s)\n"
 		"    Commands: shutdown, calibrate, 6-side, meow, scan,\n"
 		"              mag <on|off|clear|cal>, reboot, clear, dfu,\n"
 		"              channel <1-100>, clearchannel,\n"
-		"              sens <x,y,z|reset>, reset <zro|acc|bat|mag|tcal>, ping\n"
+		"              sens <x,y,z|reset>, reset <zro|acc|bat|mag|tcal|fusion>, ping\n"
 	);
 
 	printk(
@@ -294,6 +301,7 @@ static void console_thread(void)
 	uint8_t command_resetstats[] = "resetstats";
 	uint8_t command_channel[] = "channel";
 	uint8_t command_clearchannel[] = "clearchannel";
+	uint8_t command_rssi_scan[] = "rssi_scan";
 	uint8_t command_send[] = "send";
 	uint8_t command_help[] = "help";
 
@@ -464,6 +472,8 @@ static void console_thread(void)
 			}
 		} else if (memcmp(line, command_resetstats, sizeof(command_resetstats)) == 0) {
 			esb_reset_all_stats();
+		} else if (memcmp(line, command_rssi_scan, sizeof(command_rssi_scan)) == 0) {
+			rssi_scan_run_and_print();
 		} else if (memcmp(line, command_channel, sizeof(command_channel)) == 0) {
 			if (!arg) {
 				printk("Usage: channel <1-100>\n");
@@ -495,7 +505,7 @@ static void console_thread(void)
 				printk("  send all dfu         - Enter DFU mode on all trackers\n");
 				printk(
 					"Available commands: shutdown, calibrate, 6-side, meow, scan, mag, reboot, clear, dfu, sens, "
-					"reset, ping, tcal\n"
+					"reset, ping, tcal, tdma\n"
 				);
 			} else {
 				// Parse target (id or "all")
@@ -683,7 +693,7 @@ static void console_thread(void)
 				} else if (strcmp(arg2, "reset") == 0) {
 					// reset command - needs arg3 for subcommand
 					if (!arg3) {
-						printk("Usage: send <id|all> reset <zro|acc|bat|mag|tcal>\n");
+						printk("Usage: send <id|all> reset <zro|acc|bat|mag|tcal|fusion>\n");
 						printk("Example: send 0 reset zro\n");
 						printk("Example: send all reset acc\n");
 						continue;
@@ -707,9 +717,12 @@ static void console_thread(void)
 					} else if (strcmp(arg3, "tcal") == 0) {
 						reset_cmd = ESB_PONG_FLAG_RESET_TCAL;
 						reset_name = "Temperature calibration reset";
+					} else if (strcmp(arg3, "fusion") == 0) {
+						reset_cmd = ESB_PONG_FLAG_FUSION_RESET;
+						reset_name = "Fusion reset";
 					} else {
 						printk("Unknown reset command: %s\n", arg3);
-						printk("Available: zro, acc, bat, mag, tcal\n");
+						printk("Available: zro, acc, bat, mag, tcal, fusion\n");
 						continue;
 					}
 
@@ -826,12 +839,43 @@ static void console_thread(void)
 							printk("%s request sent to tracker %d\n", tcal_name, tracker_id);
 						}
 					} else {
-						printk("Unknown tcal subcommand: %s (use 'on', 'off', 'auto', 'boot' or 'clear')\n", arg3);
-					}
-					continue;
-				}
+							printk("Unknown tcal subcommand: %s (use 'on', 'off', 'auto', 'boot' or 'clear')\n", arg3);
+						}
+						continue;
+					} else if (strcmp(arg2, "tdma") == 0) {
+						// tdma command - supports "on/off"
+						if (!arg3) {
+							printk("Usage: send <id|all> tdma <on|off>\n");
+							printk("Example: send 0 tdma on       - Enable TDMA scheduling on tracker 0\n");
+							printk("Example: send all tdma off    - Disable TDMA scheduling on all trackers\n");
+							continue;
+						}
 
-				if (cmd_flag != 0xFF) {
+						if (strcmp(arg3, "on") == 0) {
+							// Enable TDMA
+							if (target_all) {
+								esb_send_remote_command_all(ESB_PONG_FLAG_TDMA_ON);
+								printk("TDMA enable request sent to all trackers\n");
+							} else {
+								esb_send_remote_command(tracker_id, ESB_PONG_FLAG_TDMA_ON);
+								printk("TDMA enable request sent to tracker %d\n", tracker_id);
+							}
+						} else if (strcmp(arg3, "off") == 0) {
+							// Disable TDMA
+							if (target_all) {
+								esb_send_remote_command_all(ESB_PONG_FLAG_TDMA_OFF);
+								printk("TDMA disable request sent to all trackers\n");
+							} else {
+								esb_send_remote_command(tracker_id, ESB_PONG_FLAG_TDMA_OFF);
+								printk("TDMA disable request sent to tracker %d\n", tracker_id);
+							}
+						} else {
+							printk("Unknown tdma subcommand: %s (use 'on' or 'off')\n", arg3);
+						}
+						continue;
+					}
+
+					if (cmd_flag != 0xFF) {
 					if (target_all) {
 						esb_send_remote_command_all(cmd_flag);
 						printk("%s request sent to all trackers\n", cmd_name);
@@ -843,7 +887,7 @@ static void console_thread(void)
 					printk("Unknown command: %s\n", arg2);
 					printk(
 						"Available commands: shutdown, calibrate, 6-side, meow, scan, mag, reboot, clear, dfu, fusion, sens, "
-						"reset, ping, tcal\n"
+						"reset, ping, tcal, tdma\n"
 					);
 				}
 			}

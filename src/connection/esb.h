@@ -31,6 +31,8 @@
 #define ESB_PONG_TYPE 0xF1
 #define ESB_PING_LEN 13
 #define ESB_PONG_LEN 13
+#define ESB_MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
+#define ESB_COMPOSITE_TYPE 0x05 // Composite packet containing multiple sub-packets
 
 // Remote command flags for PONG data[7]
 #define ESB_PONG_FLAG_NORMAL 0x00
@@ -63,10 +65,13 @@
 #define ESB_PONG_FLAG_MAG_OFF 0x1A       // Disable magnetometer
 #define ESB_PONG_FLAG_TCAL_ON 0x1B       // Enable T-Cal (temperature calibration)
 #define ESB_PONG_FLAG_TCAL_OFF 0x1C      // Disable T-Cal (temperature calibration)
+#define ESB_PONG_FLAG_TDMA_ON 0x1D       // Enable TDMA scheduling
+#define ESB_PONG_FLAG_TDMA_OFF 0x1E      // Disable TDMA scheduling
 
 void event_handler(struct esb_evt const *event);
 int clocks_start(void);
 int esb_initialize(bool);
+void esb_deinitialize(void);
 
 void esb_set_addr_discovery(void);
 void esb_set_addr_paired(void);
