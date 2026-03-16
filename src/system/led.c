@@ -3,6 +3,7 @@
 
 #include <math.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/led_strip.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/kernel.h>
 #include <zephyr/pm/device.h>
@@ -17,48 +18,55 @@ K_THREAD_DEFINE(led_thread_id, 512, led_thread, NULL, NULL, NULL, 6, 0, 0);
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
 
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, led_gpios)
-#define LED_EXISTS true
+#define LED_GPIO_EXISTS 1
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, led_gpios);
 #endif
 #if DT_NODE_EXISTS(DT_ALIAS(led0))
-#ifndef LED_EXISTS
-#define LED_EXISTS true
+#ifndef LED_GPIO_EXISTS
+#define LED_GPIO_EXISTS 1
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 #else
-#define LED0_EXISTS true
+#define LED0_EXISTS 1
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 #endif
 #endif
-#ifndef LED_EXISTS
-#warning "LED GPIO does not exist"
-//static const struct gpio_dt_spec led = {0};
-#endif
 #if DT_NODE_EXISTS(DT_ALIAS(led1))
-#define LED1_EXISTS true
+#define LED1_EXISTS 1
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 #endif
 #if DT_NODE_EXISTS(DT_ALIAS(led2))
-#define LED2_EXISTS true
+#define LED2_EXISTS 1
 static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
 #endif
 #if DT_NODE_EXISTS(DT_ALIAS(led3))
-#define LED3_EXISTS true
+#define LED3_EXISTS 1
 static const struct gpio_dt_spec led3 = GPIO_DT_SPEC_GET(DT_ALIAS(led3), gpios);
 #endif
 
 #if DT_NODE_EXISTS(DT_ALIAS(pwm_led0))
-#define PWM_LED_EXISTS true
+#define PWM_LED_EXISTS 1
 static const struct pwm_dt_spec pwm_led = PWM_DT_SPEC_GET(DT_ALIAS(pwm_led0));
 #else
 #warning "PWM LED node does not exist"
 #endif
 #if DT_NODE_EXISTS(DT_ALIAS(pwm_led1))
-#define PWM_LED1_EXISTS true
+#define PWM_LED1_EXISTS 1
 static const struct pwm_dt_spec pwm_led1 = PWM_DT_SPEC_GET(DT_ALIAS(pwm_led1));
 #endif
 #if DT_NODE_EXISTS(DT_ALIAS(pwm_led2))
-#define PWM_LED2_EXISTS true
+#define PWM_LED2_EXISTS 1
 static const struct pwm_dt_spec pwm_led2 = PWM_DT_SPEC_GET(DT_ALIAS(pwm_led2));
+#endif
+
+#if DT_NODE_EXISTS(DT_ALIAS(led_strip))
+#define LED_STRIP_EXISTS 1
+static const struct device *const led_strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
+#endif
+
+#if defined(LED_GPIO_EXISTS) || defined(LED_STRIP_EXISTS)
+#define LED_EXISTS 1
+#else
+#warning "LED device does not exist"
 #endif
 
 static enum sys_led_pattern current_led_pattern;
@@ -71,6 +79,7 @@ static int led_pattern_state;
 static int led_pin_init(void)
 {
 	LOG_DBG("led_pin_init");
+#if LED_GPIO_EXISTS
 	gpio_pin_configure_dt(&led, GPIO_OUTPUT);
 	gpio_pin_set_dt(&led, 0);
 #if LED0_EXISTS
@@ -89,6 +98,7 @@ static int led_pin_init(void)
 	gpio_pin_configure_dt(&led3, GPIO_OUTPUT);
 	gpio_pin_set_dt(&led3, 0);
 #endif
+#endif
 	return 0;
 }
 
@@ -97,6 +107,7 @@ SYS_INIT(led_pin_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 static void led_pin_reset(void)
 {
 	LOG_DBG("led_pin_reset");
+#if LED_GPIO_EXISTS
 	gpio_pin_configure_dt(&led, GPIO_DISCONNECTED);
 #if LED0_EXISTS
 	gpio_pin_configure_dt(&led0, GPIO_DISCONNECTED);
@@ -109,6 +120,7 @@ static void led_pin_reset(void)
 #endif
 #if LED3_EXISTS
 	gpio_pin_configure_dt(&led3, GPIO_DISCONNECTED);
+#endif
 #endif
 }
 
@@ -184,6 +196,17 @@ static int led_pwm_period[5][1] = {
 };
 #endif
 
+#if LED_STRIP_EXISTS
+static uint8_t led_strip_color_map[5][3] = {
+	{CONFIG_LED_DEFAULT_COLOR_R * 255 / 10000, CONFIG_LED_DEFAULT_COLOR_G * 255 / 10000,
+	 CONFIG_LED_DEFAULT_COLOR_B * 255 / 10000}, // Default
+	{0, 255, 0}, // Success
+	{255, 0, 0}, // Error
+	{204, 51, 0}, // Charging
+	{0, 0, 255}, // Pairing
+};
+#endif
+
 // Using brightness and value if PWM is supported, otherwise value is coerced to on/off
 // TODO: use computed constants for high/low brightness and color values
 static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value_pptt)
@@ -197,6 +220,19 @@ static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value
 		value_pptt = 0;
 	else if (value_pptt > 10000)
 		value_pptt = 10000;
+#if LED_STRIP_EXISTS
+	if (device_is_ready(led_strip))
+	{
+		uint32_t level = (uint32_t)value_pptt * (uint32_t)brightness_pptt / 10000;
+		struct led_rgb pixel = {
+			.r = (uint8_t)(led_strip_color_map[color][0] * level / 10000),
+			.g = (uint8_t)(led_strip_color_map[color][1] * level / 10000),
+			.b = (uint8_t)(led_strip_color_map[color][2] * level / 10000),
+		};
+		led_strip_update_rgb(led_strip, &pixel, 1);
+		return;
+	}
+#endif
 #if PWM_LED_EXISTS
 	value_pptt = value_pptt * brightness_pptt / 10000;
 	// only supporting color if PWM is supported
@@ -207,7 +243,7 @@ static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value
 	pwm_set_pulse_dt(&pwm_led2, pwm_led2.period / 10000 * (led_pwm_period[color][2] * value_pptt / 10000));
 #endif
 #endif
-#else
+#elif LED_GPIO_EXISTS
 	gpio_pin_set_dt(&led, value_pptt > 5000);
 #endif
 }
