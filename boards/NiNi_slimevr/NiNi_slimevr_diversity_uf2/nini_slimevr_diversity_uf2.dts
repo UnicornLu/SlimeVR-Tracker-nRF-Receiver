@@ -5,8 +5,8 @@
 #include <nordic/nrf52833_qdaa.dtsi>
 
 / {
-	model = "nini_slimevr_uf2";
-	compatible = "nini_slimevr_uf2";
+	model = "nini_slimevr_diversity_uf2";
+	compatible = "nini_slimevr_diversity_uf2";
 
 	chosen {
 		zephyr,sram = &sram0;
@@ -25,12 +25,36 @@
 		rx-gain-db = <12>;
 	};
 
+	buttons {
+        compatible = "gpio-keys";
+        button0: button_0 {
+            gpios = <&gpio0 13 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+            label = "Push button switch 0";
+            zephyr,code = <INPUT_KEY_0>;
+        };
+    };
+	
+    aliases {
+        sw0 = &button0;
+        led0 = &led0_blue;
+        led1 = &led1_red;
+        led0-blue = &led0_blue;
+        led1-red   = &led1_red;
+        pwm-led0 = &blue_pwm_led;
+        blue-pwm-led = &blue_pwm_led;
+        watchdog0 = &wdt0;
+    };
+};
 
 	zephyr,user {
 		led-gpios = <&gpio0 4 GPIO_OPEN_SOURCE>;
 		ant-set-gpios = <&gpio0 28 GPIO_ACTIVE_HIGH>;
 		csd-gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
 	};
+};
+
+&reg0 {
+    status = "disabled";
 };
 
 &reg1 {
@@ -44,7 +68,6 @@
 &gpiote {
 	status = "okay";
 };
-
 
 zephyr_udc0: &usbd {
 	compatible = "nordic,nrf-usbd";
@@ -61,3 +84,12 @@ zephyr_udc0: &usbd {
 &radio {
 	fem = <&nrf_radio_fem>;
 };
+
+&cryptocell {
+    status = "disabled";
+};
+
+&ieee802154 {
+    status = "okay";
+};
+
