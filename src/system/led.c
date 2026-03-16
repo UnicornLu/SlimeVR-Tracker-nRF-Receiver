@@ -3,6 +3,7 @@
 
 #include <math.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/led_strip.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/kernel.h>
 #include <zephyr/pm/device.h>
@@ -19,6 +20,22 @@ K_THREAD_DEFINE(led_thread_id, 512, led_thread, NULL, NULL, NULL, 6, 0, 0);
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, led_gpios)
 #define LED_EXISTS true
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, led_gpios);
+#endif
+
+#if DT_NODE_EXISTS(DT_ALIAS(led_strip))
+#define WS2812B_EXISTS true
+#define WS2812B_NODE DT_ALIAS(led_strip)
+#elif DT_NODE_EXISTS(DT_ALIAS(led_strip0))
+#define WS2812B_EXISTS true
+#define WS2812B_NODE DT_ALIAS(led_strip0)
+#endif
+#if WS2812B_EXISTS
+#ifndef LED_EXISTS
+#define LED_EXISTS true
+#endif
+#endif
+#if WS2812B_EXISTS && IS_ENABLED(CONFIG_LED_STRIP)
+static const struct device *ws2812b = DEVICE_DT_GET(WS2812B_NODE);
 #endif
 #if DT_NODE_EXISTS(DT_ALIAS(led0))
 #ifndef LED_EXISTS
@@ -197,6 +214,56 @@ static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value
 		value_pptt = 0;
 	else if (value_pptt > 10000)
 		value_pptt = 10000;
+
+#if WS2812B_EXISTS && IS_ENABLED(CONFIG_LED_STRIP)
+	if (device_is_ready(ws2812b))
+	{
+		struct led_rgb pixel = {0};
+		int color_pptt[3] = {0};
+#ifdef CONFIG_LED_RGB_COLOR
+		color_pptt[0] = led_pwm_period[color][0];
+		color_pptt[1] = led_pwm_period[color][1];
+		color_pptt[2] = led_pwm_period[color][2];
+#else
+		switch (color)
+		{
+		case SYS_LED_COLOR_SUCCESS:
+			color_pptt[0] = 0;
+			color_pptt[1] = 10000;
+			color_pptt[2] = 0;
+			break;
+		case SYS_LED_COLOR_ERROR:
+			color_pptt[0] = 10000;
+			color_pptt[1] = 0;
+			color_pptt[2] = 0;
+			break;
+		case SYS_LED_COLOR_CHARGING:
+			color_pptt[0] = 6000;
+			color_pptt[1] = 4000;
+			color_pptt[2] = 0;
+			break;
+		case SYS_LED_COLOR_PAIRING:
+			color_pptt[0] = 0;
+			color_pptt[1] = 0;
+			color_pptt[2] = 10000;
+			break;
+		case SYS_LED_COLOR_DEFAULT:
+		default:
+			color_pptt[0] = 0;
+			color_pptt[1] = 0;
+			color_pptt[2] = 10000;
+			break;
+		}
+#endif
+
+		int scaled_value_pptt = value_pptt * brightness_pptt / 10000;
+		pixel.r = color_pptt[0] * scaled_value_pptt / 10000 * 255 / 10000;
+		pixel.g = color_pptt[1] * scaled_value_pptt / 10000 * 255 / 10000;
+		pixel.b = color_pptt[2] * scaled_value_pptt / 10000 * 255 / 10000;
+		led_strip_update_rgb(ws2812b, &pixel, 1);
+	}
+#endif
+
 #if PWM_LED_EXISTS
 	value_pptt = value_pptt * brightness_pptt / 10000;
 	// only supporting color if PWM is supported

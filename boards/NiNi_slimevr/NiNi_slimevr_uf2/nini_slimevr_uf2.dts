@@ -3,37 +3,60 @@
 
 /dts-v1/;
 #include <nordic/nrf52833_qdaa.dtsi>
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+#include <zephyr/dt-bindings/led/led.h>
 
 / {
 	model = "nini_slimevr_uf2";
 	compatible = "nini_slimevr_uf2";
 
 	chosen {
-		zephyr,sram = &sram0;
-		zephyr,flash = &flash0;
-		zephyr,console = &cdc_acm_uart0;
-		zephyr,shell-uart = &cdc_acm_uart0;
+		zephyr,sram = <&sram0>;
+		zephyr,flash = <&flash0>;
+		zephyr,console = <&cdc_acm_uart0>;
+		zephyr,shell-uart = <&cdc_acm_uart0>;
 	};
 
 	nrf_radio_fem: se2431_fem {
 		compatible = "skyworks,se2431", "generic-fem-two-ctrl-pins";
-		ctx-gpios = <&gpio0 30 GPIO_ACTIVE_HIGH>;  /* TXEN */
+		ctx-gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;  /* TXEN */
 		ctx-settle-time-us = <23>;
-		crx-gpios = <&gpio0 29 GPIO_ACTIVE_HIGH>;  /* RXEN */
+		crx-gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>;  /* RXEN */
 		crx-settle-time-us = <8>;
 		tx-gain-db = <22>;
 		rx-gain-db = <19>;
 	};
 
+	led_strip: ws2812b {
+		compatible = "worldsemi,ws2812-gpio";
+		gpios = <&gpio0 30 GPIO_ACTIVE_HIGH>;
+		chain-length = <1>;
+		color-mapping = <LED_COLOR_ID_GREEN LED_COLOR_ID_RED LED_COLOR_ID_BLUE>;
+		status = "okay";
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		button0: button_0 {
+			gpios = <&gpio0 29 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 0";
+			zephyr,code = <INPUT_KEY_0>;
+		};
+	};
+
+	aliases {
+		led-strip = <&led_strip>;
+		sw0 = <&button0>;
+	};
+
 	zephyr,user {
-		led-gpios = <&gpio0 4 GPIO_OPEN_SOURCE>;
 		ant-set-gpios = <&gpio0 28 GPIO_ACTIVE_HIGH>;
 		csd-gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
 	};
 };
 
 &reg1 {
-	regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
 };
 
 &gpio0 {
@@ -43,7 +66,6 @@
 &gpiote {
 	status = "okay";
 };
-
 
 zephyr_udc0: &usbd {
 	compatible = "nordic,nrf-usbd";
