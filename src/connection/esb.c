@@ -41,8 +41,8 @@ LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 // TDMA parameters (must match Tracker's tdma.h)
 #define TDMA_ENABLED 0
 #define TDMA_NUM_TRACKERS 10
-#define TDMA_SLOT_TICKS    18  /* ~550μs at 32768Hz */
-#define TDMA_FRAME_TICKS   (TDMA_SLOT_TICKS * TDMA_NUM_TRACKERS)  /* 180 ticks ≈ 5.5ms */
+#define TDMA_SLOT_TICKS    20  /* ~610μs at 32768Hz */
+#define TDMA_FRAME_TICKS   (TDMA_SLOT_TICKS * TDMA_NUM_TRACKERS)  /* 200 ticks ≈ 6.1ms */
 
 static struct esb_payload rx_payload;
 // static struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0,
