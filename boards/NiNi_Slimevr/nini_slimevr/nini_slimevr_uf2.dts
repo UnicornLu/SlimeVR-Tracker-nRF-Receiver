@@ -20,7 +20,7 @@
 		zephyr,ieee802154 = &ieee802154;
 	};
 
-	nrf_radio_fem: at2401c_fem {
+	nrf_radio_fem: skyFem {
 		compatible = "skyworks,sky66112-11", "generic-fem-two-ctrl-pins";
 		ctx-gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
 		ctx-settle-time-us = <2>;
@@ -89,6 +89,10 @@ zephyr_udc0: &usbd {
 	cdc_acm_uart: cdc_acm_uart {
 		compatible = "zephyr,cdc-acm-uart";
 	};
+};
+
+&cryptocell {
+	status = "disabled";
 };
 
 &nfct {
