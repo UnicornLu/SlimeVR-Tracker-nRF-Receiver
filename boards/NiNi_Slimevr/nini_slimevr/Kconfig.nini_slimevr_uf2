@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 config BOARD_NINI_SLIMEVR_UF2
-	select SOC_NRF52833_QIAA
+	select SOC_NRF52833_QDAA
 
 if BOARD_NINI_SLIMEVR_UF2
 
