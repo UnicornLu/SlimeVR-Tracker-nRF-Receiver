@@ -91,6 +91,10 @@ zephyr_udc0: &usbd {
 	};
 };
 
+&wdt {
+	status = "okay";
+};
+
 &nfct {
 	status = "disabled";
 };
