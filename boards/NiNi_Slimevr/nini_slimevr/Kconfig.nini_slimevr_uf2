@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 config BOARD_NINI_SLIMEVR_UF2
+<<<<<<< Updated upstream
 	select SOC_NRF52833_QDAA
+=======
+	select SOC_NRF52833_QIAA
+>>>>>>> Stashed changes
 
 if BOARD_NINI_SLIMEVR_UF2
 
@@ -33,4 +37,8 @@ config MPSL_FEM_GENERIC_TWO_CTRL_PINS_SUPPORT
     bool
     default y
 
+<<<<<<< Updated upstream
 endif # BOARD_NINI_SLIMEVR_UF2
+=======
+endif
+>>>>>>> Stashed changes
