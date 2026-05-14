@@ -32,7 +32,7 @@
 #define ESB_PING_LEN 13
 #define ESB_PONG_LEN 13
 #define ESB_MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
-#define ESB_COMPOSITE_TYPE 0x05 // Composite packet containing multiple sub-packets
+#define ESB_COMPOSITE_TYPE 0xFE // Composite packet containing multiple sub-packets
 
 // Remote command flags for PONG data[7]
 #define ESB_PONG_FLAG_NORMAL 0x00
@@ -69,6 +69,13 @@
 #define ESB_PONG_FLAG_TEST_MODE_ON 0x1F  // Enable battery drain test mode
 #define ESB_PONG_FLAG_TEST_MODE_OFF 0x20 // Disable battery drain test mode
 #define ESB_PONG_FLAG_DFU_OTA 0x21       // Enter OTA DFU bootloader
+#define ESB_PONG_FLAG_DATA_COLLECT_ON 0x22  // Start raw data collection
+#define ESB_PONG_FLAG_DATA_COLLECT_OFF 0x23 // Stop raw data collection
+
+// Raw data collection packet types
+#define ESB_RAW_IMU_TYPE    0x10  // Raw IMU data (float, with piggybacked mag)
+#define ESB_RAW_MAG_TYPE    0x11  // Raw magnetometer data (float, reserved)
+#define ESB_RAW_META_TYPE   0x12  // Metadata (ODR, range, sensor IDs - sent once)
 
 void event_handler(struct esb_evt const *event);
 int clocks_start(void);
