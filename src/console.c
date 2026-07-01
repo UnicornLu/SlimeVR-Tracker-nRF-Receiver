@@ -23,6 +23,7 @@
 #include "globals.h"
 #include "system/system.h"
 #include "build_defines.h"
+#include "parse_args.h"
 
 #define USB DT_NODELABEL(usbd)
 #if DT_NODE_HAS_STATUS(USB, okay)
@@ -270,6 +271,26 @@ static void print_list(void)
 	}
 }
 
+static inline void strtolower(char *str)
+{
+	for (int i = 0; str[i] != '\0'; i++) {
+		str[i] = (char)tolower((unsigned char)str[i]);
+	}
+}
+
+static bool parse_u8_arg(const char *str, uint8_t *value)
+{
+	char *endptr = NULL;
+	unsigned long parsed = strtoul(str, &endptr, 10);
+
+	if (endptr == str || *endptr != '\0' || parsed > UINT8_MAX) {
+		return false;
+	}
+
+	*value = (uint8_t)parsed;
+	return true;
+}
+
 static void console_thread(void)
 {
 #if DFU_EXISTS
@@ -320,114 +341,63 @@ static void console_thread(void)
 
 	printk("Type 'help' to show available commands.\n");
 
-	uint8_t command_info[] = "info";
-	uint8_t command_uptime[] = "uptime";
-	uint8_t command_list[] = "list";
-	uint8_t command_reboot[] = "reboot";
-	uint8_t command_add[] = "add";
-	uint8_t command_remove[] = "remove";
-	uint8_t command_pair[] = "pair";
-	uint8_t command_exit[] = "exit";
-	uint8_t command_clear[] = "clear";
-	uint8_t command_stats[] = "stats";
-	uint8_t command_resetstats[] = "resetstats";
-	uint8_t command_channel[] = "channel";
-	uint8_t command_clearchannel[] = "clearchannel";
-	uint8_t command_rssi_scan[] = "rssi_scan";
-	uint8_t command_send[] = "send";
-	uint8_t command_help[] = "help";
+	const char command_info[] = "info";
+	const char command_uptime[] = "uptime";
+	const char command_list[] = "list";
+	const char command_reboot[] = "reboot";
+	const char command_add[] = "add";
+	const char command_remove[] = "remove";
+	const char command_pair[] = "pair";
+	const char command_exit[] = "exit";
+	const char command_clear[] = "clear";
+	const char command_stats[] = "stats";
+	const char command_resetstats[] = "resetstats";
+	const char command_channel[] = "channel";
+	const char command_clearchannel[] = "clearchannel";
+	const char command_rssi_scan[] = "rssi_scan";
+	const char command_send[] = "send";
+	const char command_help[] = "help";
 
 #if DFU_EXISTS
-	uint8_t command_dfu[] = "dfu";
+	const char command_dfu[] = "dfu";
 #endif
 
-	uint8_t command_meow[] = "meow";
-	uint8_t command_collect[] = "collect";
-	uint8_t command_ota[] = "ota";
+	const char command_meow[] = "meow";
+	const char command_collect[] = "collect";
+	const char command_ota[] = "ota";
 
 	while (1) {
-		uint8_t *line = console_getline();
-		uint8_t *arg = NULL;
-		uint8_t *arg2 = NULL;
-		uint8_t *arg3 = NULL;
-		uint8_t *arg4 = NULL;
-
-		// Parse command and arguments
-		uint8_t *p = line;
-		while (*p) {
-			*p = tolower(*p);
-			p++;
+		char *line = console_getline();
+		char *argv[8] = {NULL};
+		size_t argc = parse_args(line, argv, ARRAY_SIZE(argv));
+		if (argc == 0) {
+			continue;
+		}
+		for (size_t i = 0; i < argc; i++) {
+			strtolower(argv[i]);
 		}
 
-		// Split by spaces
-		p = line;
-		while (*p && *p != ' ') {
-			p++;
-		}
-		if (*p == ' ') {
-			*p = 0;
-			p++;
-			while (*p == ' ') {
-				p++; // Skip multiple spaces
-			}
-			if (*p) {
-				arg = p;
-				// Find second argument
-				while (*p && *p != ' ') {
-					p++;
-				}
-				if (*p == ' ') {
-					*p = 0;
-					p++;
-					while (*p == ' ') {
-						p++;
-					}
-					if (*p) {
-						arg2 = p;
-						// Find third argument
-						while (*p && *p != ' ') {
-							p++;
-						}
-						if (*p == ' ') {
-							*p = 0;
-							p++;
-							while (*p == ' ') {
-								p++;
-							}
-							if (*p) {
-								arg3 = p;
-								// Find fourth argument
-								while (*p && *p != ' ') {
-									p++;
-								}
-								if (*p == ' ') {
-									*p = 0;
-									p++;
-									while (*p == ' ') {
-										p++;
-									}
-									if (*p) {
-										arg4 = p;
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
+		char *arg = argc > 1 ? argv[1] : NULL;
+		char *arg2 = argc > 2 ? argv[2] : NULL;
+		char *arg3 = argc > 3 ? argv[3] : NULL;
+		char *arg4 = argc > 4 ? argv[4] : NULL;
+		char *arg5 = argc > 5 ? argv[5] : NULL;
 
-		if (memcmp(line, command_help, sizeof(command_help)) == 0) {
+		if (strcmp(argv[0], command_help) == 0) {
 			print_help();
-		} else if (memcmp(line, command_info, sizeof(command_info)) == 0) {
+		} else if (strcmp(argv[0], command_info) == 0) {
 			print_info();
-		} else if (memcmp(line, command_uptime, sizeof(command_uptime)) == 0) {
+		} else if (strcmp(argv[0], command_uptime) == 0) {
 			print_uptime();
-		} else if (memcmp(line, command_add, sizeof(command_add)) == 0) {
-			uint64_t addr = strtoull(arg, NULL, 16);
-			uint8_t buf[13];
+		} else if (strcmp(argv[0], command_add) == 0) {
+			if (argc != 2) {
+				printk("Invalid number of arguments\n");
+				continue;
+			}
+			uint64_t addr = parse_u64(arg, 16);
+			char buf[13];
 			snprintk(buf, 13, "%012llx", addr);
-			if (addr != 0 && memcmp(buf, arg, 13) == 0) {
+			if (addr != 0 && strcmp(buf, arg) == 0) {
 				int slot = esb_add_pair(addr, true);
 				if (slot >= 0) {
 					printk("Tracker stored in slot %d\n", slot);
@@ -441,14 +411,14 @@ static void console_thread(void)
 			} else {
 				printk("Invalid address\n");
 			}
-		} else if (memcmp(line, command_remove, sizeof(command_remove)) == 0) {
+		} else if (strcmp(argv[0], command_remove) == 0) {
 			esb_pop_pair();
-		} else if (memcmp(line, command_list, sizeof(command_list)) == 0) {
+		} else if (strcmp(argv[0], command_list) == 0) {
 			print_list();
-		} else if (memcmp(line, command_reboot, sizeof(command_reboot)) == 0) {
+		} else if (strcmp(argv[0], command_reboot) == 0) {
 			skip_dfu();
 			sys_reboot(SYS_REBOOT_COLD);
-		} else if (memcmp(line, command_pair, sizeof(command_pair)) == 0) {
+		} else if (strcmp(argv[0], command_pair) == 0) {
 			if (!arg) {
 				// No argument: traditional pairing mode with timeout
 				esb_start_pairing();
@@ -470,11 +440,11 @@ static void console_thread(void)
 					printk("Pairing mode enabled (auto-exit after %u new devices or %d seconds)\n", (uint8_t)count, CONFIG_PAIRING_TIMEOUT);
 				}
 			}
-		} else if (memcmp(line, command_exit, sizeof(command_exit)) == 0) {
+		} else if (strcmp(argv[0], command_exit) == 0) {
 			esb_finish_pair();
-		} else if (memcmp(line, command_clear, sizeof(command_clear)) == 0) {
+		} else if (strcmp(argv[0], command_clear) == 0) {
 			esb_clear();
-		} else if (memcmp(line, command_stats, sizeof(command_stats)) == 0) {
+		} else if (strcmp(argv[0], command_stats) == 0) {
 			if (!arg) {
 				// No argument: toggle detailed stats
 				bool enabled = esb_toggle_stats_detailed();
@@ -504,11 +474,11 @@ static void console_thread(void)
 					printk("Detailed stats enabled for %ld seconds\n", duration);
 				}
 			}
-		} else if (memcmp(line, command_resetstats, sizeof(command_resetstats)) == 0) {
+		} else if (strcmp(argv[0], command_resetstats) == 0) {
 			esb_reset_all_stats();
-		} else if (memcmp(line, command_rssi_scan, sizeof(command_rssi_scan)) == 0) {
+		} else if (strcmp(argv[0], command_rssi_scan) == 0) {
 			rssi_scan_run_and_print();
-		} else if (memcmp(line, command_channel, sizeof(command_channel)) == 0) {
+		} else if (strcmp(argv[0], command_channel) == 0) {
 			if (!arg) {
 				printk("Usage: channel <1-100>\n");
 				printk("Example: channel 25 - Set receiver RF channel to 25 (local only)\n");
@@ -523,10 +493,10 @@ static void console_thread(void)
 					printk("Receiver RF channel set to %d (local only)\n", (int)channel);
 				}
 			}
-		} else if (memcmp(line, command_clearchannel, sizeof(command_clearchannel)) == 0) {
+		} else if (strcmp(argv[0], command_clearchannel) == 0) {
 			esb_clear_receiver_channel();
 			printk("Receiver RF channel cleared (local only)\n");
-		} else if (memcmp(line, command_send, sizeof(command_send)) == 0) {
+		} else if (strcmp(argv[0], command_send) == 0) {
 			if (!arg || !arg2) {
 				printk("Usage: send <id|all> <command>\n");
 				printk("Examples:\n");
@@ -712,14 +682,7 @@ static void console_thread(void)
 							continue;
 						}
 
-						char *rev_str = NULL;
-						if (arg4[1] == ' ') {
-							arg4[1] = '\0';
-							rev_str = (char *)arg4 + 2;
-							while (*rev_str == ' ') {
-								rev_str++;
-							}
-						} else if (arg4[1] != '\0') {
+						if (arg4[1] != '\0') {
 							printk("Usage: send <id|all> sens auto <x|y|z> [revolutions]\n");
 							continue;
 						}
@@ -737,11 +700,11 @@ static void console_thread(void)
 						}
 
 						uint16_t revolutions = 0;
-						if (rev_str && *rev_str) {
+						if (arg5 && *arg5) {
 							char *endptr;
-							long value = strtol(rev_str, &endptr, 10);
+							long value = strtol(arg5, &endptr, 10);
 							if (*endptr != '\0' || value < 1 || value > SENS_AUTO_MAX_REVOLUTIONS) {
-								printk("Invalid revolutions '%s'. Use 1 to %u.\n", rev_str, SENS_AUTO_MAX_REVOLUTIONS);
+								printk("Invalid revolutions '%s'. Use 1 to %u.\n", arg5, SENS_AUTO_MAX_REVOLUTIONS);
 								continue;
 							}
 							revolutions = (uint16_t)value;
@@ -1061,10 +1024,10 @@ static void console_thread(void)
 			}
 		}
 #if DFU_EXISTS
-		else if (memcmp(line, command_dfu, sizeof(command_dfu)) == 0) {
+		else if (strcmp(argv[0], command_dfu) == 0) {
 			bool ota = false;
 			if (arg) {
-				if (strcmp((char *)arg, "ota") == 0) {
+				if (strcmp(arg, "ota") == 0) {
 					ota = true;
 				} else {
 					printk("Unknown dfu argument: %s (use 'ota' or omit it)\n", arg);
@@ -1074,12 +1037,12 @@ static void console_thread(void)
 			request_local_dfu(ota);
 		}
 #endif
-		else if (memcmp(line, command_meow, sizeof(command_meow)) == 0) {
+		else if (strcmp(argv[0], command_meow) == 0) {
 			print_meow();
 		}
-		else if (memcmp(line, command_collect, sizeof(command_collect) - 1) == 0) {
+		else if (strcmp(argv[0], command_collect) == 0) {
 #ifdef CONFIG_DATA_COLLECT
-			if (arg && strcmp((char *)arg, "off") == 0) {
+			if (arg && strcmp(arg, "off") == 0) {
 				if (data_collect_is_active()) {
 					uint8_t tid = data_collect_get_target_id();
 					data_collect_stop();
@@ -1090,8 +1053,8 @@ static void console_thread(void)
 				}
 			} else if (arg) {
 				char *endptr = NULL;
-				unsigned long id = strtoul((char *)arg, &endptr, 10);
-				if (endptr != (char *)arg && id < 255) {
+				unsigned long id = strtoul(arg, &endptr, 10);
+				if (endptr != arg && *endptr == '\0' && id < 255) {
 					data_collect_start((uint8_t)id);
 					esb_send_remote_command((uint8_t)id, ESB_PONG_FLAG_DATA_COLLECT_ON);
 					printk("Data collection started for tracker %u\n", (unsigned)id);
@@ -1114,25 +1077,33 @@ static void console_thread(void)
 			printk("Data collection not available (build with CONFIG_DATA_COLLECT=y)\n");
 #endif
 		}
-		else if (memcmp(line, command_ota, sizeof(command_ota) - 1) == 0) {
+		else if (strcmp(argv[0], command_ota) == 0) {
 			if (!arg) {
 				/* "ota" with no args → show status */
 				esb_ota_relay_console_cmd(0, "status");
-			} else if (strcmp((char *)arg, "abort") == 0 ||
-				   strcmp((char *)arg, "cancel") == 0) {
+			} else if (strcmp(arg, "abort") == 0 ||
+				   strcmp(arg, "cancel") == 0) {
 				if (arg2) {
-					int id = atoi((char *)arg2);
-					esb_ota_relay_console_cmd((uint8_t)id, "abort");
+					uint8_t id;
+					if (!parse_u8_arg(arg2, &id)) {
+						printk("Invalid tracker ID: %s\n", arg2);
+						continue;
+					}
+					esb_ota_relay_console_cmd(id, "abort");
 				} else {
 					/* Abort all OTA targets */
 					esb_ota_relay_console_cmd(0xFF, "abort");
 				}
-			} else if (strcmp((char *)arg, "status") == 0) {
+			} else if (strcmp(arg, "status") == 0) {
 				esb_ota_relay_console_cmd(0, "status");
-			} else if (strcmp((char *)arg, "info") == 0) {
+			} else if (strcmp(arg, "info") == 0) {
 				if (arg2) {
-					int id = atoi((char *)arg2);
-					esb_ota_relay_console_cmd((uint8_t)id, "info");
+					uint8_t id;
+					if (!parse_u8_arg(arg2, &id)) {
+						printk("Invalid tracker ID: %s\n", arg2);
+						continue;
+					}
+					esb_ota_relay_console_cmd(id, "info");
 				} else {
 					printk("Usage: ota info <tracker_id>\n");
 				}
