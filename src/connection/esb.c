@@ -2426,6 +2426,12 @@ void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag)
 		case ESB_PONG_FLAG_MAG_OFF:
 			cmd_name = "MAG_OFF";
 			break;
+		case ESB_PONG_FLAG_MAG_AUTO_ON:
+			cmd_name = "MAG_AUTO_ON";
+			break;
+		case ESB_PONG_FLAG_MAG_AUTO_OFF:
+			cmd_name = "MAG_AUTO_OFF";
+			break;
 		case ESB_PONG_FLAG_REBOOT:
 			cmd_name = "REBOOT";
 			break;
@@ -2561,6 +2567,12 @@ void esb_send_remote_command_all(uint8_t command_flag)
 		break;
 	case ESB_PONG_FLAG_MAG_OFF:
 		cmd_name = "MAG_OFF";
+		break;
+	case ESB_PONG_FLAG_MAG_AUTO_ON:
+		cmd_name = "MAG_AUTO_ON";
+		break;
+	case ESB_PONG_FLAG_MAG_AUTO_OFF:
+		cmd_name = "MAG_AUTO_OFF";
 		break;
 	case ESB_PONG_FLAG_REBOOT:
 		cmd_name = "REBOOT";

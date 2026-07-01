@@ -199,7 +199,7 @@ static void print_help(void)
 		"Remote Commands:\n"
 		"  send <id|all> <command>    Send remote command to tracker(s)\n"
 		"    Commands: shutdown, calibrate, 6-side, meow, scan,\n"
-		"              mag <on|off|clear|cal>, reboot, clear, dfu [ota],\n"
+		"              mag <on|off|clear|cal|auto on|auto off>, reboot, clear, dfu [ota],\n"
 		"              channel <1-100>, clearchannel,\n"
 		"              sens <x,y,z|reset|auto <x|y|z> [rev]>,\n"
 		"              reset <zro|acc|bat|mag|tcal|fusion>, ping\n"
@@ -578,13 +578,14 @@ static void console_thread(void)
 					cmd_flag = ESB_PONG_FLAG_SCAN;
 					cmd_name = "Sensor scan";
 				} else if (strcmp(arg2, "mag") == 0) {
-					// mag command - supports "on", "off", "clear", "cal"
 					if (!arg3) {
-						printk("Usage: send <id|all> mag <on|off|clear|cal>\n");
-						printk("  on    - Enable magnetometer\n");
-						printk("  off   - Disable magnetometer\n");
-						printk("  clear - Clear magnetometer calibration\n");
-						printk("  cal   - Start magnetometer calibration\n");
+						printk("Usage: send <id|all> mag <on|off|clear|cal|auto on|auto off>\n");
+						printk("  on       - Enable magnetometer\n");
+						printk("  off      - Disable magnetometer\n");
+						printk("  clear    - Clear magnetometer calibration\n");
+						printk("  cal      - Start magnetometer calibration\n");
+						printk("  auto on  - Enable online magnetometer calibration\n");
+						printk("  auto off - Disable online magnetometer calibration\n");
 						continue;
 					}
 
@@ -603,8 +604,23 @@ static void console_thread(void)
 					} else if (strcmp(arg3, "cal") == 0 || strcmp(arg3, "calibrate") == 0) {
 						mag_cmd = ESB_PONG_FLAG_MAG_CAL;
 						mag_name = "Magnetometer calibration";
+					} else if (strcmp(arg3, "auto") == 0 || strcmp(arg3, "online") == 0) {
+						if (!arg4) {
+							printk("Usage: send <id|all> mag %s <on|off>\n", arg3);
+							continue;
+						}
+						if (strcmp(arg4, "on") == 0) {
+							mag_cmd = ESB_PONG_FLAG_MAG_AUTO_ON;
+							mag_name = "Online magnetometer calibration enable";
+						} else if (strcmp(arg4, "off") == 0) {
+							mag_cmd = ESB_PONG_FLAG_MAG_AUTO_OFF;
+							mag_name = "Online magnetometer calibration disable";
+						} else {
+							printk("Invalid mag %s argument: %s (use 'on' or 'off')\n", arg3, arg4);
+							continue;
+						}
 					} else {
-						printk("Unknown mag subcommand: %s (use 'on', 'off', 'clear' or 'cal')\n", arg3);
+						printk("Unknown mag subcommand: %s (use 'on', 'off', 'clear', 'cal' or 'auto')\n", arg3);
 						continue;
 					}
 
