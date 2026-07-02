@@ -23,6 +23,7 @@
 #include "globals.h"
 #include "system/system.h"
 #include "build_defines.h"
+#include "parse_args.h"
 
 #define USB DT_NODELABEL(usbd)
 #if DT_NODE_HAS_STATUS(USB, okay)
@@ -35,6 +36,7 @@
 #include "connection/esb.h"
 #include "connection/rssi_scan.h"
 #include "data_collect.h"
+#include "esb_ota.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -55,6 +57,7 @@ K_THREAD_DEFINE(console_thread_id, 1024, console_thread, NULL, NULL, NULL, 6, 0,
 #define NRF5_BOOTLOADER CONFIG_BOARD_HAS_NRF5_BOOTLOADER
 #define ADAFRUIT_DFU_MAGIC_UF2_RESET 0x57
 #define ADAFRUIT_DFU_MAGIC_OTA_RESET 0xA8
+#define SENS_AUTO_MAX_REVOLUTIONS 100
 
 #if NRF5_BOOTLOADER
 static const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
@@ -96,9 +99,9 @@ static void request_local_dfu(bool ota)
 
 static void print_info(void)
 {
-	printk(CONFIG_USB_DEVICE_MANUFACTURER " " CONFIG_USB_DEVICE_PRODUCT "\n");
+	printk(CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT "\n");
 	printk(FW_STRING);
-	printk("Repo: %s | Branch: %s | Author: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH, FW_GIT_AUTHOR);
+	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
 
 	printk("\nBoard: " CONFIG_BOARD "\n");
 	printk("SOC: " CONFIG_SOC "\n");
@@ -197,9 +200,10 @@ static void print_help(void)
 		"Remote Commands:\n"
 		"  send <id|all> <command>    Send remote command to tracker(s)\n"
 		"    Commands: shutdown, calibrate, 6-side, meow, scan,\n"
-		"              mag <on|off|clear|cal>, reboot, clear, dfu [ota],\n"
+		"              mag <on|off|clear|cal|auto on|auto off>, reboot, clear, dfu [ota],\n"
 		"              channel <1-100>, clearchannel,\n"
-		"              sens <x,y,z|reset>, reset <zro|acc|bat|mag|tcal|fusion>, ping\n"
+		"              sens <x,y,z|reset|auto <x|y|z> [rev]>,\n"
+		"              reset <zro|acc|bat|mag|tcal|fusion>, ping\n"
 	);
 
 	printk(
@@ -209,6 +213,7 @@ static void print_help(void)
 		"      send 1 meow              Make tracker 1 meow\n"
 		"      send 2 reboot            Reboot tracker 2\n"
 		"      send 0 sens 1.0,1.0,1.0  Set sensitivity for tracker 0\n"
+		"      send 0 sens auto z       Auto-calibrate Z sensitivity on tracker 0\n"
 		"      send all sens reset      Reset sensitivity for all\n"
 		"      send 1 reset zro         Reset ZRO calibration on tracker 1\n"
 		"      send all ping            Ping all active trackers\n"
@@ -236,6 +241,9 @@ static void print_help(void)
 		"  collect <id>               Start raw sensor data collection from tracker\n"
 		"  collect off                Stop data collection\n"
 		"  collect                    Show data collection status\n"
+		"  ota                        Show ESB OTA update status\n"
+		"  ota info <id>              Query firmware info from tracker\n"
+		"  ota abort                  Abort active OTA session\n"
 		"  meow                       Meow!\n"
 		"  help                       Show this help message\n"
 		"\n"
@@ -261,6 +269,26 @@ static void print_list(void)
 	for (uint8_t i = 0; i < stored_trackers; i++) {
 		printk("%012llX\n", stored_tracker_addr[i]);
 	}
+}
+
+static inline void strtolower(char *str)
+{
+	for (int i = 0; str[i] != '\0'; i++) {
+		str[i] = (char)tolower((unsigned char)str[i]);
+	}
+}
+
+static bool parse_u8_arg(const char *str, uint8_t *value)
+{
+	char *endptr = NULL;
+	unsigned long parsed = strtoul(str, &endptr, 10);
+
+	if (endptr == str || *endptr != '\0' || parsed > UINT8_MAX) {
+		return false;
+	}
+
+	*value = (uint8_t)parsed;
+	return true;
 }
 
 static void console_thread(void)
@@ -307,120 +335,69 @@ static void console_thread(void)
 		k_msleep(100);
 	}
 
-	printk("*** " CONFIG_USB_DEVICE_MANUFACTURER " " CONFIG_USB_DEVICE_PRODUCT " ***\n");
+	printk("*** " CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT " ***\n");
 	printk(FW_STRING);
-	printk("Repo: %s | Branch: %s | Author: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH, FW_GIT_AUTHOR);
+	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
 
-	// Print help on startup
-	print_help();
+	printk("Type 'help' to show available commands.\n");
 
-	uint8_t command_info[] = "info";
-	uint8_t command_uptime[] = "uptime";
-	uint8_t command_list[] = "list";
-	uint8_t command_reboot[] = "reboot";
-	uint8_t command_add[] = "add";
-	uint8_t command_remove[] = "remove";
-	uint8_t command_pair[] = "pair";
-	uint8_t command_exit[] = "exit";
-	uint8_t command_clear[] = "clear";
-	uint8_t command_stats[] = "stats";
-	uint8_t command_resetstats[] = "resetstats";
-	uint8_t command_channel[] = "channel";
-	uint8_t command_clearchannel[] = "clearchannel";
-	uint8_t command_rssi_scan[] = "rssi_scan";
-	uint8_t command_send[] = "send";
-	uint8_t command_help[] = "help";
+	const char command_info[] = "info";
+	const char command_uptime[] = "uptime";
+	const char command_list[] = "list";
+	const char command_reboot[] = "reboot";
+	const char command_add[] = "add";
+	const char command_remove[] = "remove";
+	const char command_pair[] = "pair";
+	const char command_exit[] = "exit";
+	const char command_clear[] = "clear";
+	const char command_stats[] = "stats";
+	const char command_resetstats[] = "resetstats";
+	const char command_channel[] = "channel";
+	const char command_clearchannel[] = "clearchannel";
+	const char command_rssi_scan[] = "rssi_scan";
+	const char command_send[] = "send";
+	const char command_help[] = "help";
 
 #if DFU_EXISTS
-	uint8_t command_dfu[] = "dfu";
+	const char command_dfu[] = "dfu";
 #endif
 
-	uint8_t command_meow[] = "meow";
-	uint8_t command_collect[] = "collect";
+	const char command_meow[] = "meow";
+	const char command_collect[] = "collect";
+	const char command_ota[] = "ota";
 
 	while (1) {
-		uint8_t *line = console_getline();
-		uint8_t *arg = NULL;
-		uint8_t *arg2 = NULL;
-		uint8_t *arg3 = NULL;
-		uint8_t *arg4 = NULL;
-
-		// Parse command and arguments
-		uint8_t *p = line;
-		while (*p) {
-			*p = tolower(*p);
-			p++;
+		char *line = console_getline();
+		char *argv[8] = {NULL};
+		size_t argc = parse_args(line, argv, ARRAY_SIZE(argv));
+		if (argc == 0) {
+			continue;
+		}
+		for (size_t i = 0; i < argc; i++) {
+			strtolower(argv[i]);
 		}
 
-		// Split by spaces
-		p = line;
-		while (*p && *p != ' ') {
-			p++;
-		}
-		if (*p == ' ') {
-			*p = 0;
-			p++;
-			while (*p == ' ') {
-				p++; // Skip multiple spaces
-			}
-			if (*p) {
-				arg = p;
-				// Find second argument
-				while (*p && *p != ' ') {
-					p++;
-				}
-				if (*p == ' ') {
-					*p = 0;
-					p++;
-					while (*p == ' ') {
-						p++;
-					}
-					if (*p) {
-						arg2 = p;
-						// Find third argument
-						while (*p && *p != ' ') {
-							p++;
-						}
-						if (*p == ' ') {
-							*p = 0;
-							p++;
-							while (*p == ' ') {
-								p++;
-							}
-							if (*p) {
-								arg3 = p;
-								// Find fourth argument
-								while (*p && *p != ' ') {
-									p++;
-								}
-								if (*p == ' ') {
-									*p = 0;
-									p++;
-									while (*p == ' ') {
-										p++;
-									}
-									if (*p) {
-										arg4 = p;
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
+		char *arg = argc > 1 ? argv[1] : NULL;
+		char *arg2 = argc > 2 ? argv[2] : NULL;
+		char *arg3 = argc > 3 ? argv[3] : NULL;
+		char *arg4 = argc > 4 ? argv[4] : NULL;
+		char *arg5 = argc > 5 ? argv[5] : NULL;
 
-		if (memcmp(line, command_help, sizeof(command_help)) == 0) {
+		if (strcmp(argv[0], command_help) == 0) {
 			print_help();
-		} else if (memcmp(line, command_info, sizeof(command_info)) == 0) {
+		} else if (strcmp(argv[0], command_info) == 0) {
 			print_info();
-		} else if (memcmp(line, command_uptime, sizeof(command_uptime)) == 0) {
+		} else if (strcmp(argv[0], command_uptime) == 0) {
 			print_uptime();
-		} else if (memcmp(line, command_add, sizeof(command_add)) == 0) {
-			uint64_t addr = strtoull(arg, NULL, 16);
-			uint8_t buf[13];
+		} else if (strcmp(argv[0], command_add) == 0) {
+			if (argc != 2) {
+				printk("Invalid number of arguments\n");
+				continue;
+			}
+			uint64_t addr = parse_u64(arg, 16);
+			char buf[13];
 			snprintk(buf, 13, "%012llx", addr);
-			if (addr != 0 && memcmp(buf, arg, 13) == 0) {
+			if (addr != 0 && strcmp(buf, arg) == 0) {
 				int slot = esb_add_pair(addr, true);
 				if (slot >= 0) {
 					printk("Tracker stored in slot %d\n", slot);
@@ -434,14 +411,14 @@ static void console_thread(void)
 			} else {
 				printk("Invalid address\n");
 			}
-		} else if (memcmp(line, command_remove, sizeof(command_remove)) == 0) {
+		} else if (strcmp(argv[0], command_remove) == 0) {
 			esb_pop_pair();
-		} else if (memcmp(line, command_list, sizeof(command_list)) == 0) {
+		} else if (strcmp(argv[0], command_list) == 0) {
 			print_list();
-		} else if (memcmp(line, command_reboot, sizeof(command_reboot)) == 0) {
+		} else if (strcmp(argv[0], command_reboot) == 0) {
 			skip_dfu();
 			sys_reboot(SYS_REBOOT_COLD);
-		} else if (memcmp(line, command_pair, sizeof(command_pair)) == 0) {
+		} else if (strcmp(argv[0], command_pair) == 0) {
 			if (!arg) {
 				// No argument: traditional pairing mode with timeout
 				esb_start_pairing();
@@ -463,11 +440,11 @@ static void console_thread(void)
 					printk("Pairing mode enabled (auto-exit after %u new devices or %d seconds)\n", (uint8_t)count, CONFIG_PAIRING_TIMEOUT);
 				}
 			}
-		} else if (memcmp(line, command_exit, sizeof(command_exit)) == 0) {
+		} else if (strcmp(argv[0], command_exit) == 0) {
 			esb_finish_pair();
-		} else if (memcmp(line, command_clear, sizeof(command_clear)) == 0) {
+		} else if (strcmp(argv[0], command_clear) == 0) {
 			esb_clear();
-		} else if (memcmp(line, command_stats, sizeof(command_stats)) == 0) {
+		} else if (strcmp(argv[0], command_stats) == 0) {
 			if (!arg) {
 				// No argument: toggle detailed stats
 				bool enabled = esb_toggle_stats_detailed();
@@ -497,11 +474,11 @@ static void console_thread(void)
 					printk("Detailed stats enabled for %ld seconds\n", duration);
 				}
 			}
-		} else if (memcmp(line, command_resetstats, sizeof(command_resetstats)) == 0) {
+		} else if (strcmp(argv[0], command_resetstats) == 0) {
 			esb_reset_all_stats();
-		} else if (memcmp(line, command_rssi_scan, sizeof(command_rssi_scan)) == 0) {
+		} else if (strcmp(argv[0], command_rssi_scan) == 0) {
 			rssi_scan_run_and_print();
-		} else if (memcmp(line, command_channel, sizeof(command_channel)) == 0) {
+		} else if (strcmp(argv[0], command_channel) == 0) {
 			if (!arg) {
 				printk("Usage: channel <1-100>\n");
 				printk("Example: channel 25 - Set receiver RF channel to 25 (local only)\n");
@@ -516,10 +493,10 @@ static void console_thread(void)
 					printk("Receiver RF channel set to %d (local only)\n", (int)channel);
 				}
 			}
-		} else if (memcmp(line, command_clearchannel, sizeof(command_clearchannel)) == 0) {
+		} else if (strcmp(argv[0], command_clearchannel) == 0) {
 			esb_clear_receiver_channel();
 			printk("Receiver RF channel cleared (local only)\n");
-		} else if (memcmp(line, command_send, sizeof(command_send)) == 0) {
+		} else if (strcmp(argv[0], command_send) == 0) {
 			if (!arg || !arg2) {
 				printk("Usage: send <id|all> <command>\n");
 				printk("Examples:\n");
@@ -571,13 +548,14 @@ static void console_thread(void)
 					cmd_flag = ESB_PONG_FLAG_SCAN;
 					cmd_name = "Sensor scan";
 				} else if (strcmp(arg2, "mag") == 0) {
-					// mag command - supports "on", "off", "clear", "cal"
 					if (!arg3) {
-						printk("Usage: send <id|all> mag <on|off|clear|cal>\n");
-						printk("  on    - Enable magnetometer\n");
-						printk("  off   - Disable magnetometer\n");
-						printk("  clear - Clear magnetometer calibration\n");
-						printk("  cal   - Start magnetometer calibration\n");
+						printk("Usage: send <id|all> mag <on|off|clear|cal|auto on|auto off>\n");
+						printk("  on       - Enable magnetometer\n");
+						printk("  off      - Disable magnetometer\n");
+						printk("  clear    - Clear magnetometer calibration\n");
+						printk("  cal      - Start magnetometer calibration\n");
+						printk("  auto on  - Enable online magnetometer calibration\n");
+						printk("  auto off - Disable online magnetometer calibration\n");
 						continue;
 					}
 
@@ -596,8 +574,23 @@ static void console_thread(void)
 					} else if (strcmp(arg3, "cal") == 0 || strcmp(arg3, "calibrate") == 0) {
 						mag_cmd = ESB_PONG_FLAG_MAG_CAL;
 						mag_name = "Magnetometer calibration";
+					} else if (strcmp(arg3, "auto") == 0 || strcmp(arg3, "online") == 0) {
+						if (!arg4) {
+							printk("Usage: send <id|all> mag %s <on|off>\n", arg3);
+							continue;
+						}
+						if (strcmp(arg4, "on") == 0) {
+							mag_cmd = ESB_PONG_FLAG_MAG_AUTO_ON;
+							mag_name = "Online magnetometer calibration enable";
+						} else if (strcmp(arg4, "off") == 0) {
+							mag_cmd = ESB_PONG_FLAG_MAG_AUTO_OFF;
+							mag_name = "Online magnetometer calibration disable";
+						} else {
+							printk("Invalid mag %s argument: %s (use 'on' or 'off')\n", arg3, arg4);
+							continue;
+						}
 					} else {
-						printk("Unknown mag subcommand: %s (use 'on', 'off', 'clear' or 'cal')\n", arg3);
+						printk("Unknown mag subcommand: %s (use 'on', 'off', 'clear', 'cal' or 'auto')\n", arg3);
 						continue;
 					}
 
@@ -665,9 +658,12 @@ static void console_thread(void)
 				} else if (strcmp(arg2, "sens") == 0) {
 					// sens command - needs arg3 for values or "reset"
 					if (!arg3) {
-						printk("Usage: send <id|all> sens <x>,<y>,<z> or send <id|all> sens reset\n");
+						printk("Usage: send <id|all> sens <x>,<y>,<z>\n");
+						printk("Usage: send <id|all> sens reset\n");
+						printk("Usage: send <id|all> sens auto <x|y|z> [revolutions]\n");
 						printk("Example: send 0 sens 1.0,1.0,1.0\n");
 						printk("Example: send all sens reset\n");
+						printk("Example: send 0 sens auto z 5\n");
 						continue;
 					}
 
@@ -679,6 +675,77 @@ static void console_thread(void)
 						} else {
 							esb_send_remote_command(tracker_id, ESB_PONG_FLAG_SENS_RESET);
 							printk("Sens reset request sent to tracker %d\n", tracker_id);
+						}
+					} else if (strcmp(arg3, "auto") == 0) {
+						if (!arg4 || arg4[0] == '\0') {
+							printk("Usage: send <id|all> sens auto <x|y|z> [revolutions]\n");
+							continue;
+						}
+
+						if (arg4[1] != '\0') {
+							printk("Usage: send <id|all> sens auto <x|y|z> [revolutions]\n");
+							continue;
+						}
+
+						uint8_t axis;
+						if (arg4[0] == 'x') {
+							axis = 0;
+						} else if (arg4[0] == 'y') {
+							axis = 1;
+						} else if (arg4[0] == 'z') {
+							axis = 2;
+						} else {
+							printk("Invalid axis '%s'. Use x, y, or z.\n", arg4);
+							continue;
+						}
+
+						uint16_t revolutions = 0;
+						if (arg5 && *arg5) {
+							char *endptr;
+							long value = strtol(arg5, &endptr, 10);
+							if (*endptr != '\0' || value < 1 || value > SENS_AUTO_MAX_REVOLUTIONS) {
+								printk("Invalid revolutions '%s'. Use 1 to %u.\n", arg5, SENS_AUTO_MAX_REVOLUTIONS);
+								continue;
+							}
+							revolutions = (uint16_t)value;
+						}
+
+						if (target_all) {
+							uint8_t count = esb_send_remote_command_sens_auto_all(axis, revolutions);
+							if (revolutions == 0) {
+								printk(
+									"Sens auto request sent to %u active tracker%s on %c axis using tracker default rev\n",
+									count,
+									count == 1 ? "" : "s",
+									'x' + axis
+								);
+							} else {
+								printk(
+									"Sens auto request sent to %u active tracker%s on %c axis for %u rev\n",
+									count,
+									count == 1 ? "" : "s",
+									'x' + axis,
+									revolutions
+								);
+							}
+						} else {
+							bool queued = esb_send_remote_command_sens_auto(tracker_id, axis, revolutions);
+							if (!queued) {
+								printk("Sens auto request not queued: tracker %d is not active\n", tracker_id);
+							} else if (revolutions == 0) {
+								printk(
+									"Sens auto request sent to tracker %d on %c axis using tracker default rev\n",
+									tracker_id,
+									'x' + axis
+								);
+							} else {
+								printk(
+									"Sens auto request sent to tracker %d on %c axis for %u rev\n",
+									tracker_id,
+									'x' + axis,
+									revolutions
+								);
+							}
 						}
 					} else {
 						// Parse comma-separated floats
@@ -957,10 +1024,10 @@ static void console_thread(void)
 			}
 		}
 #if DFU_EXISTS
-		else if (memcmp(line, command_dfu, sizeof(command_dfu)) == 0) {
+		else if (strcmp(argv[0], command_dfu) == 0) {
 			bool ota = false;
 			if (arg) {
-				if (strcmp((char *)arg, "ota") == 0) {
+				if (strcmp(arg, "ota") == 0) {
 					ota = true;
 				} else {
 					printk("Unknown dfu argument: %s (use 'ota' or omit it)\n", arg);
@@ -970,12 +1037,12 @@ static void console_thread(void)
 			request_local_dfu(ota);
 		}
 #endif
-		else if (memcmp(line, command_meow, sizeof(command_meow)) == 0) {
+		else if (strcmp(argv[0], command_meow) == 0) {
 			print_meow();
 		}
-		else if (memcmp(line, command_collect, sizeof(command_collect) - 1) == 0) {
+		else if (strcmp(argv[0], command_collect) == 0) {
 #ifdef CONFIG_DATA_COLLECT
-			if (arg && strcmp((char *)arg, "off") == 0) {
+			if (arg && strcmp(arg, "off") == 0) {
 				if (data_collect_is_active()) {
 					uint8_t tid = data_collect_get_target_id();
 					data_collect_stop();
@@ -986,8 +1053,8 @@ static void console_thread(void)
 				}
 			} else if (arg) {
 				char *endptr = NULL;
-				unsigned long id = strtoul((char *)arg, &endptr, 10);
-				if (endptr != (char *)arg && id < 255) {
+				unsigned long id = strtoul(arg, &endptr, 10);
+				if (endptr != arg && *endptr == '\0' && id < 255) {
 					data_collect_start((uint8_t)id);
 					esb_send_remote_command((uint8_t)id, ESB_PONG_FLAG_DATA_COLLECT_ON);
 					printk("Data collection started for tracker %u\n", (unsigned)id);
@@ -1009,6 +1076,40 @@ static void console_thread(void)
 #else
 			printk("Data collection not available (build with CONFIG_DATA_COLLECT=y)\n");
 #endif
+		}
+		else if (strcmp(argv[0], command_ota) == 0) {
+			if (!arg) {
+				/* "ota" with no args → show status */
+				esb_ota_relay_console_cmd(0, "status");
+			} else if (strcmp(arg, "abort") == 0 ||
+				   strcmp(arg, "cancel") == 0) {
+				if (arg2) {
+					uint8_t id;
+					if (!parse_u8_arg(arg2, &id)) {
+						printk("Invalid tracker ID: %s\n", arg2);
+						continue;
+					}
+					esb_ota_relay_console_cmd(id, "abort");
+				} else {
+					/* Abort all OTA targets */
+					esb_ota_relay_console_cmd(0xFF, "abort");
+				}
+			} else if (strcmp(arg, "status") == 0) {
+				esb_ota_relay_console_cmd(0, "status");
+			} else if (strcmp(arg, "info") == 0) {
+				if (arg2) {
+					uint8_t id;
+					if (!parse_u8_arg(arg2, &id)) {
+						printk("Invalid tracker ID: %s\n", arg2);
+						continue;
+					}
+					esb_ota_relay_console_cmd(id, "info");
+				} else {
+					printk("Usage: ota info <tracker_id>\n");
+				}
+			} else {
+				printk("OTA commands: ota, ota info <id>, ota abort, ota status\n");
+			}
 		}
 		else {
 			printk("Unknown command\n");

@@ -71,11 +71,28 @@
 #define ESB_PONG_FLAG_DFU_OTA 0x21       // Enter OTA DFU bootloader
 #define ESB_PONG_FLAG_DATA_COLLECT_ON 0x22  // Start raw data collection
 #define ESB_PONG_FLAG_DATA_COLLECT_OFF 0x23 // Stop raw data collection
+#define ESB_PONG_FLAG_SENS_AUTO 0x24        // Auto-calibrate gyro sensitivity
+#define ESB_PONG_FLAG_MAG_AUTO_ON 0x25      // Enable online magnetometer calibration
+#define ESB_PONG_FLAG_MAG_AUTO_OFF 0x26     // Disable online magnetometer calibration
+#define ESB_PONG_FLAG_OTA_QUERY_INFO 0x30   // Request firmware info for ESB OTA
+#define ESB_PONG_FLAG_OTA_ABORT 0x31        // Abort ESB OTA update
+#define ESB_PONG_FLAG_OTA_SUPPRESS 0x32     // Suppress tracker during OTA (reduce poll rate)
+#define ESB_PONG_FLAG_OTA_UNSUPPRESS 0x33   // Resume normal poll rate after OTA
 
 // Raw data collection packet types
 #define ESB_RAW_IMU_TYPE    0x10  // Raw IMU data (float, with piggybacked mag)
 #define ESB_RAW_MAG_TYPE    0x11  // Raw magnetometer data (float, reserved)
 #define ESB_RAW_META_TYPE   0x12  // Metadata (ODR, range, sensor IDs - sent once)
+#define ESB_RAW_IMU_QUAT_TYPE 0x13  // Raw IMU with gyrQuat (52 bytes, packet-loss resistant)
+#define ESB_RAW_CAL_TYPE    0x14  // Extended calibration metadata (sub-typed)
+
+// ESB OTA packet types (used during firmware update over ESB)
+#define ESB_OTA_DATA_TYPE       0x20  // OTA firmware data (receiver → tracker)
+#define ESB_OTA_STATUS_TYPE     0x21  // OTA status report (tracker → receiver)
+#define ESB_OTA_FW_INFO_TYPE    0x22  // Firmware info report (tracker → receiver)
+#define ESB_OTA_BEGIN_TYPE      0x23  // Begin OTA session (receiver → tracker)
+#define ESB_OTA_VERIFY_TYPE     0x24  // Request CRC verification (receiver → tracker)
+#define ESB_OTA_ACTIVATE_TYPE   0x25  // Activate new firmware (receiver → tracker)
 
 void event_handler(struct esb_evt const *event);
 int clocks_start(void);
@@ -110,6 +127,8 @@ uint32_t esb_get_stats_detailed_remaining(void); // Get remaining time (0 if no 
 void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag);
 void esb_send_remote_command_all(uint8_t command_flag);
 void esb_send_remote_command_sens(uint8_t tracker_id, float x, float y, float z);
+bool esb_send_remote_command_sens_auto(uint8_t tracker_id, uint8_t axis, uint16_t revolutions);
+uint8_t esb_send_remote_command_sens_auto_all(uint8_t axis, uint16_t revolutions);
 void esb_set_all_trackers_channel(uint8_t channel); // Set RF channel for all trackers
 void esb_clear_all_trackers_channel(void);          // Clear RF channel setting (restore default)
 

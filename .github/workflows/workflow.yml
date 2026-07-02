@@ -198,6 +198,7 @@ jobs:
       matrix:
         boards: [
                   {boardname: "styria_r1_uf2/nrf52840", filename: "SlimeNRF_Styria_R1_Receiver"},
+                  {boardname: "styria_r1_uf2/nrf52840", filename: "SlimeNRF_Styria_R1_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                   {boardname: "aerorx_r1_uf2/nrf52840", filename: "SlimeNRF_AeroRX_R1_Receiver"},
                   {boardname: "nini_slimevr_uf2/nrf52833", filename: "SlimeNRF_NiNi_SlimeVR_Receiver"},
                 ]
@@ -283,6 +284,13 @@ jobs:
             echo "Repo dir not found: $REPO_DIR; fallback to SlimeNRF-CI"
             REPO_DIR="SlimeNRF-CI"
           fi
+          EXTRA_CMAKE_ARGS=()
+          if [ "${{ matrix.boards.with_data_collect_cdc }}" = "true" ]; then
+            EXTRA_CMAKE_ARGS+=(
+              -DEXTRA_CONF_FILE=boards/data_collect_cdc.conf
+              -DEXTRA_DTC_OVERLAY_FILE=boards/data_collect_cdc.overlay
+            )
+          fi
           rm -rf "$REPO_DIR/build"
           west build \
               --board ${{ matrix.boards.boardname }} \
@@ -290,7 +298,8 @@ jobs:
               --build-dir "$REPO_DIR/build" \
               -- \
               -DNCS_TOOLCHAIN_VERSION=NONE \
-              -DBOARD_ROOT=../"$REPO_DIR"
+              -DBOARD_ROOT=../"$REPO_DIR" \
+              "${EXTRA_CMAKE_ARGS[@]}"
 
           for ext in uf2 hex; do
             src="$REPO_DIR/build/$REPO_DIR/zephyr/zephyr.${ext}"
