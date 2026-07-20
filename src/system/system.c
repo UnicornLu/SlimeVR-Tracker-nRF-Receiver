@@ -39,9 +39,40 @@ K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, 6, 0, 0
 #endif
 
 // DFU support check
-#define DFU_EXISTS CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER)
 #define DFU_DBL_RESET_MEM 0x20007F7C
 #define DFU_DBL_RESET_APP 0x4ee5677e
+#define ADAFRUIT_DFU_MAGIC_UF2_RESET 0x57
+#define ADAFRUIT_DFU_MAGIC_OTA_RESET 0xA8
+
+static uint32_t *dbl_reset_mem = ((uint32_t *)DFU_DBL_RESET_MEM);
+
+void sys_skip_dfu_marker(void)
+{
+#if DFU_EXISTS
+	(*dbl_reset_mem) = DFU_DBL_RESET_APP;
+	ram_range_retain(dbl_reset_mem, sizeof(*dbl_reset_mem), true);
+#endif
+}
+
+void sys_enter_dfu(bool ota)
+{
+#if CONFIG_BUILD_OUTPUT_UF2
+	NRF_POWER->GPREGRET = ota ? ADAFRUIT_DFU_MAGIC_OTA_RESET : ADAFRUIT_DFU_MAGIC_UF2_RESET;
+	k_msleep(100);
+	sys_request_system_reboot();
+#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+	ARG_UNUSED(ota);
+	const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+	if (device_is_ready(gpio_dev)) {
+		gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
+		k_msleep(100);
+	}
+	sys_request_system_reboot();
+#else
+	ARG_UNUSED(ota);
+#endif
+}
 
 static bool nvs_init = false;
 
@@ -189,26 +220,7 @@ static void button_thread(void)
 			{
 				LOG_INF("DFU mode requested (10s)");
 				set_led(SYS_LED_PATTERN_ERROR_D, SYS_LED_PRIORITY_HIGHEST);
-#if DFU_EXISTS
-#if CONFIG_BUILD_OUTPUT_UF2 // Adafruit bootloader
-				NRF_POWER->GPREGRET = 0x57;
-#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER // NRF5 bootloader
-				// Use GPIO method to enter DFU
-				const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
-				if (device_is_ready(gpio_dev))
-				{
-					gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
-				}
-#else
-				// Use double reset memory method as fallback
-				*dbl_reset_mem = DFU_DBL_RESET_APP;
-				ram_range_retain(dbl_reset_mem, sizeof(*dbl_reset_mem), true);
-#endif
-				// Wait a bit to ensure data is written
-				k_msleep(100);
-#endif
-				// System reboot to enter DFU
-				sys_request_system_reboot();
+				sys_enter_dfu(false);
 				long_press_10s_handled = true;
 				return; // Exit thread as system will reboot
 			}
