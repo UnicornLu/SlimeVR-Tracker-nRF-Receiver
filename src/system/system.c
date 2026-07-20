@@ -32,7 +32,8 @@ static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios
 static int64_t press_time = 0;
 static int64_t last_press_duration = 0;
 static void button_thread(void);
-K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, 6, 0, 0);
+/* prio 8: below esb_thread (7); keep equal with led/status */
+K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, 8, 0, 0);
 #else
 #define BUTTON_EXISTS false
 #pragma message "Button GPIO does not exist"
@@ -113,8 +114,10 @@ SYS_INIT(sys_nvs_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 
 // TODO: switch back to retained?
 uint8_t reboot_counter_read(void) {
-	uint8_t reboot_counter;
-	nvs_read(&fs, RBT_CNT_ID, &reboot_counter, sizeof(reboot_counter));
+	uint8_t reboot_counter = 0;
+	if (nvs_read(&fs, RBT_CNT_ID, &reboot_counter, sizeof(reboot_counter)) < 0) {
+		return 0;
+	}
 	return reboot_counter;
 }
 

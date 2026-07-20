@@ -854,10 +854,8 @@ static void raw_arq_process_isr(uint16_t received_seq, struct esb_payload *ack_p
 		/* Retransmitted (out-of-order) packet: remove from gap queue */
 		for (uint8_t i = 0; i < raw_arq_gap_count; i++) {
 			if (raw_arq_gap_queue[i] == received_seq) {
-				/* Shift remaining entries */
-				for (uint8_t j = i; j + 1 < raw_arq_gap_count; j++) {
-					raw_arq_gap_queue[j] = raw_arq_gap_queue[j + 1];
-				}
+				/* O(1) swap-delete — ISR must stay short */
+				raw_arq_gap_queue[i] = raw_arq_gap_queue[raw_arq_gap_count - 1];
 				raw_arq_gap_count--;
 				raw_arq_retransmits_received++;
 				break;
@@ -1320,16 +1318,22 @@ void event_handler(struct esb_evt const *event)
 					}
 					g_last_ping_isr_rx_ticks_raw[tracker_id] = isr_rx_ticks;
 
-					uint64_t rx_time_diff_us
-						= k_ticks_to_us_floor64((rx_time_diff_ticks < 0 ? -rx_time_diff_ticks : rx_time_diff_ticks));
-#if !TDMA_ENABLED
-					ARG_UNUSED(rx_time_diff_us);
-#endif
-					// Log periodically
-					int64_t now_ms = k_uptime_get();
-					if (stats->count > 0) {
+					/*
+					 * TDMA window log (Newton sqrt + UART) stays OFF the EVENT IRQ
+					 * path unless detailed stats are enabled — otherwise every PING
+					 * stretches IRQ latency and risks ESB RX FIFO overflow.
+					 */
+#if TDMA_ENABLED
+					if (stats->count > 0 && esb_get_stats_detailed_enabled()) {
+						uint64_t rx_time_diff_us = k_ticks_to_us_floor64(
+							(rx_time_diff_ticks < 0 ? -rx_time_diff_ticks : rx_time_diff_ticks)
+						);
 						int64_t mean = stats->sum_offset / stats->count;
-						uint64_t variance = (stats->sum_sq_offset / stats->count) - (mean * mean);
+						int64_t mean_sq = mean * mean;
+						uint64_t variance = 0;
+						if (stats->sum_sq_offset / stats->count >= (uint64_t)mean_sq) {
+							variance = (stats->sum_sq_offset / stats->count) - (uint64_t)mean_sq;
+						}
 						uint32_t std_dev = 0;
 						if (variance > 0) {
 							uint64_t s = variance / 2;
@@ -1346,8 +1350,7 @@ void event_handler(struct esb_evt const *event)
 							}
 						}
 
-#if TDMA_ENABLED
-						if (stats->violations > 12 && esb_get_stats_detailed_enabled()) {
+						if (stats->violations > 12) {
 							LOG_WRN(
 								"TDMA Stats ID=%u Count=%u Viol=%u Mean=%lld StdDev=%u EMA=%d "
 								"Range=[%d,%d] RxDiff=%s%llu us",
@@ -1362,34 +1365,20 @@ void event_handler(struct esb_evt const *event)
 								rx_time_diff_ticks >= 0 ? "+" : "-",
 								rx_time_diff_us
 							);
-						} else {
-							LOG_DBG(
-								"TDMA Stats ID=%u Count=%u Viol=%u Mean=%lld StdDev=%u EMA=%d "
-								"Range=[%d,%d] RxDiff=%s%llu us",
-								tracker_id,
-								stats->count,
-								stats->violations,
-								mean,
-								std_dev,
-								stats->phase_initialized ? (stats->phase_ema_q8 >> 8) : 0,
-								stats->min_offset,
-								stats->max_offset,
-								rx_time_diff_ticks >= 0 ? "+" : "-",
-								rx_time_diff_us
-							);
 						}
-#else
-						ARG_UNUSED(rx_time_diff_ticks);
-#endif
 					}
+#else
+					ARG_UNUSED(rx_time_diff_ticks);
+					ARG_UNUSED(stats);
+#endif
 
-					// Reset stats (preserve phase EMA across windows)
+					/* Always reset window counters; keep phase EMA. Cheap path. */
 					int32_t saved_ema = stats->phase_ema_q8;
 					bool saved_init = stats->phase_initialized;
 					memset(stats, 0, sizeof(struct tdma_stats));
 					stats->phase_ema_q8 = saved_ema;
 					stats->phase_initialized = saved_init;
-					stats->last_log_time = now_ms;
+					stats->last_log_time = k_uptime_get();
 				}
 
 				// Check for PING control packet and respond with PONG
@@ -1399,28 +1388,22 @@ void event_handler(struct esb_evt const *event)
 
 					uint8_t ping_ack_flag = rx_payload.data[7];
 
+					/* ack_handler clamps; this path must too before any [MAX_TRACKERS] index. */
+					if (tracker_id >= MAX_TRACKERS) {
+						break;
+					}
+
 					if (rx_payload.pipe != 1 + (tracker_id % 7)) {
 						static uint8_t pipe_mismatch_count[MAX_TRACKERS] = {0};
 						pipe_mismatch_count[tracker_id]++;
-
-						if (pipe_mismatch_count[tracker_id] % 10 == 1) {
-							LOG_WRN(
-								"PING pipe mismatch (x%u): id=%u, expected "
-								"pipe=%u got pipe=%u",
-								pipe_mismatch_count[tracker_id],
-								tracker_id,
-								1 + (tracker_id % 7),
-								rx_payload.pipe
-							);
-						} else {
-							LOG_DBG(
-								"PING pipe mismatch: id=%u, expected pipe=%u "
-								"got pipe=%u",
-								tracker_id,
-								1 + (tracker_id % 7),
-								rx_payload.pipe
-							);
-						}
+						LOG_DBG(
+							"PING pipe mismatch (x%u): id=%u, expected "
+							"pipe=%u got pipe=%u",
+							pipe_mismatch_count[tracker_id],
+							tracker_id,
+							1 + (tracker_id % 7),
+							rx_payload.pipe
+						);
 					}
 
 					// check crc for PING
@@ -1430,25 +1413,13 @@ void event_handler(struct esb_evt const *event)
 						static uint8_t crc_error_count[MAX_TRACKERS] = {0};
 						crc_error_count[tracker_id]++;
 
-						if (crc_error_count[tracker_id] % 5 == 1) {
-							// Log every 5th error
-							LOG_WRN(
-								"PING CRC mismatch (x%u): id=%u expected %02X "
-								"got %02X",
-								crc_error_count[tracker_id],
-								tracker_id,
-								crc_calc,
-								rx_payload.data[ESB_PING_LEN - 1]
-							);
-						} else {
-							LOG_DBG(
-								"PING CRC mismatch: id=%u expected %02X got "
-								"%02X",
-								tracker_id,
-								crc_calc,
-								rx_payload.data[ESB_PING_LEN - 1]
-							);
-						}
+						LOG_DBG(
+							"PING CRC mismatch (x%u): id=%u expected %02X got %02X",
+							crc_error_count[tracker_id],
+							tracker_id,
+							crc_calc,
+							rx_payload.data[ESB_PING_LEN - 1]
+						);
 						break;
 					}
 
@@ -1486,7 +1457,7 @@ void event_handler(struct esb_evt const *event)
 						// Check for timeout - if no PING received for more than 5 seconds, reset expectation
 						if (last_ping_time[tracker_id] > 0
 							&& (current_time - last_ping_time[tracker_id]) > PING_TIMEOUT_MS) {
-							LOG_INF(
+							LOG_WRN(
 								"PING timeout (%llu ms), resetting tracker %u counter tracking",
 								current_time - last_ping_time[tracker_id],
 								tracker_id
@@ -1520,7 +1491,7 @@ void event_handler(struct esb_evt const *event)
 								} else if (counter < 5) {
 									// Large backward step and small counter - possibly a restart
 									is_tracker_restart = true;
-									LOG_INF(
+									LOG_DBG(
 										"Tracker restart detected: id=%u old_ctr=%u new_ctr=%u (backward=%d)",
 										tracker_id,
 										last_ping_counter[tracker_id],
@@ -1530,7 +1501,7 @@ void event_handler(struct esb_evt const *event)
 								} else {
 									// Large backward step but counter not small - long packet loss + wrap-around
 									is_large_gap = true;
-									LOG_WRN(
+									LOG_DBG(
 										"Long packet loss with wraparound: id=%u last=%u new=%u (backward=%d, "
 										"accepting)",
 										tracker_id,
@@ -1604,7 +1575,8 @@ void event_handler(struct esb_evt const *event)
 					if (ping_ack_flag != ESB_PONG_FLAG_NORMAL) {
 						if (tracker_remote_command[tracker_id] == ping_ack_flag) {
 							tracker_remote_command[tracker_id] = ESB_PONG_FLAG_NORMAL;
-							LOG_INF(
+							/* Confirmations are frequent under load — keep UART off EVENT IRQ. */
+							LOG_DBG(
 								"Tracker %u confirmed command %s (0x%02X)",
 								tracker_id,
 								esb_pong_flag_name(ping_ack_flag),
@@ -1622,7 +1594,7 @@ void event_handler(struct esb_evt const *event)
 								// could race with other trackers confirming concurrently.
 								atomic_val_t old_mask = atomic_or(&channel_ack_mask, (1 << tracker_id));
 								atomic_val_t new_mask = old_mask | (1 << tracker_id);
-								LOG_INF(
+								LOG_DBG(
 									"Tracker %u confirmed channel change "
 									"(%u/%u confirmed)",
 									tracker_id,
@@ -1757,6 +1729,11 @@ void event_handler(struct esb_evt const *event)
 				/* Sequence byte is at the very end of the composite packet */
 				uint8_t received_sequence = rx_payload.data[rx_payload.length - 1];
 				int seq_result = check_packet_sequence(tracker_id, received_sequence);
+				/* seq_result: 0=normal, 1=potential loss, 2=out of order, 3=reboot, 4=duplicate */
+				if (seq_result == 4) {
+					LOG_WRN("TRK %d: Duplicate composite packet seq=%d, dropped", tracker_id, received_sequence);
+					break; /* duplicate */
+				}
 				if (seq_result == 2) {
 					LOG_WRN("TRK %d: Composite packet seq=%d is out-of-order, dropped", tracker_id, received_sequence);
 					break; /* out-of-order */
@@ -2701,7 +2678,6 @@ static void nvs_writer_thread(void)
 	struct nvs_write_request req;
 	while (1) {
 		k_msgq_get(&nvs_write_msgq, &req, K_FOREVER);
-		k_msleep(5); // Simulate async write delay
 		sys_write(req.id, NULL, req.data, req.len);
 	}
 }

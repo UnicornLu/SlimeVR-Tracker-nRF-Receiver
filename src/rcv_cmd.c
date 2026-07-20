@@ -49,6 +49,20 @@ static void rssi_scan_work_handler(struct k_work *work)
 
 static K_WORK_DEFINE(rssi_scan_work, rssi_scan_work_handler);
 
+/* Own queue so multi-second scan cannot stall HID send_report on system WQ. */
+static K_THREAD_STACK_DEFINE(rssi_wq_stack, 1024);
+static struct k_work_q rssi_wq;
+
+static int rssi_wq_init(void)
+{
+	k_work_queue_init(&rssi_wq);
+	k_work_queue_start(&rssi_wq, rssi_wq_stack, K_THREAD_STACK_SIZEOF(rssi_wq_stack), 9, NULL);
+	k_thread_name_set(&rssi_wq.thread, "rssi_wq");
+	return 0;
+}
+
+SYS_INIT(rssi_wq_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+
 static void reset_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -158,7 +172,7 @@ uint8_t rcv_cmd_rssi_scan(void)
 	if (!atomic_cas(&rssi_scan_busy, 0, 1)) {
 		return RCV_HID_ST_EBUSY;
 	}
-	k_work_submit(&rssi_scan_work);
+	k_work_submit_to_queue(&rssi_wq, &rssi_scan_work);
 	return RCV_HID_ST_STARTED;
 }
 

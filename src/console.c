@@ -32,7 +32,6 @@
 #include <zephyr/console/console.h>
 #include <zephyr/logging/log_ctrl.h>
 #include "connection/esb.h"
-#include "connection/rssi_scan.h"
 #include "console_send.h"
 #include "data_collect.h"
 #include "esb_ota.h"
@@ -46,7 +45,8 @@
 LOG_MODULE_REGISTER(console, LOG_LEVEL_INF);
 
 static void console_thread(void);
-K_THREAD_DEFINE(console_thread_id, 1024, console_thread, NULL, NULL, NULL, 6, 0, 0);
+/* prio 8: below esb_thread (7); console must not preempt radio housekeeping */
+K_THREAD_DEFINE(console_thread_id, 1024, console_thread, NULL, NULL, NULL, 8, 0, 0);
 
 #define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER)
 
@@ -381,8 +381,13 @@ static void console_thread(void)
 		} else if (strcmp(argv[0], command_resetstats) == 0) {
 			rcv_cmd_resetstats();
 		} else if (strcmp(argv[0], command_rssi_scan) == 0) {
-			/* Keep console blocking. HID path uses async rcv_cmd_rssi_scan(). */
-			rssi_scan_run_and_print();
+			/* Same busy gate as HID; avoids concurrent esb_deinitialize. */
+			uint8_t st = rcv_cmd_rssi_scan();
+			if (st == RCV_HID_ST_EBUSY) {
+				printk("RSSI scan already in progress\n");
+			} else if (st == RCV_HID_ST_STARTED) {
+				printk("RSSI scan started\n");
+			}
 		} else if (strcmp(argv[0], command_channel) == 0) {
 			if (!arg) {
 				printk("Usage: channel <1-100>\n");

@@ -265,4 +265,5 @@ static void usb_init_thread(void)
 	}
 }
 
-K_THREAD_DEFINE(usb_init_thread_id, 256, usb_init_thread, NULL, NULL, NULL, 6, 0, 500);
+/* prio 8: below esb_thread (7); one-shot USB init must not outrank radio */
+K_THREAD_DEFINE(usb_init_thread_id, 256, usb_init_thread, NULL, NULL, NULL, 8, 0, 500);
