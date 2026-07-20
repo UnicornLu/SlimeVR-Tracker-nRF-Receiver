@@ -430,8 +430,10 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 	uint32_t staging_base = RCV_OTA_FLASH_END - (image_pages * RCV_OTA_FLASH_PAGE_SIZE);
 	staging_base &= ~(RCV_OTA_FLASH_PAGE_SIZE - 1);
 
-	/* Verify staging doesn't overlap running firmware */
-	if (staging_base < RCV_OTA_FLASH_BASE + image_size) {
+	/* Verify staging doesn't overlap running firmware (or final image region) */
+	extern char _flash_used[];
+	uint32_t current_app_size = (uint32_t)_flash_used;
+	if (staging_base < RCV_OTA_FLASH_BASE + MAX(image_size, current_app_size)) {
 		LOG_ERR("RCV OTA: image too large for staging (%u bytes, staging at 0x%05X)",
 			image_size, staging_base);
 		rcv_ota.state = RCV_OTA_ERROR;
@@ -678,6 +680,11 @@ static void rcv_ota_writer_fn(void *p1, void *p2, void *p3)
 
 static void rcv_ota_start_writer(void)
 {
+	/* BEGIN after ERROR/COMPLETE must not double-create on the same stack. */
+	if (writer_running) {
+		rcv_ota_stop_writer();
+	}
+
 	writer_error = false;
 	writer_running = true;
 	k_msgq_purge(&page_write_msgq);
@@ -834,6 +841,7 @@ static int rcv_ota_flush_page_buf(void)
 	int ret = k_msgq_put(&page_write_msgq, &slot, K_MSEC(5000));
 	if (ret != 0) {
 		LOG_ERR("RCV OTA: page write queue full (timeout)");
+		k_sem_give(slot_sems[slot]);
 		return -ENOSPC;
 	}
 
