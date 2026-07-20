@@ -45,8 +45,8 @@
 LOG_MODULE_REGISTER(console, LOG_LEVEL_INF);
 
 static void console_thread(void);
-/* prio 8: below esb_thread (7); console must not preempt radio housekeeping */
-K_THREAD_DEFINE(console_thread_id, 1024, console_thread, NULL, NULL, NULL, 8, 0, 0);
+/* below ESB_THREAD_PRIORITY; console must not preempt radio housekeeping */
+K_THREAD_DEFINE(console_thread_id, 1024, console_thread, NULL, NULL, NULL, CONSOLE_THREAD_PRIORITY, 0, 0);
 
 #define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER)
 

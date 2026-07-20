@@ -12,6 +12,7 @@
 #include "esb_ota.h"
 #include "hid.h"
 #include "build_defines.h"
+#include "thread_priority.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/flash.h>
@@ -67,7 +68,6 @@ LOG_MODULE_REGISTER(receiver_ota, LOG_LEVEL_INF);
  */
 
 #define RCV_OTA_WRITER_STACK_SIZE  4096
-#define RCV_OTA_WRITER_PRIORITY    7
 
 K_THREAD_STACK_DEFINE(rcv_ota_writer_stack, RCV_OTA_WRITER_STACK_SIZE);
 static struct k_thread rcv_ota_writer_thread;

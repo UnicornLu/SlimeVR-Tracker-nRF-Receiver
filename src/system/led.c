@@ -12,8 +12,8 @@
 LOG_MODULE_REGISTER(led, LOG_LEVEL_INF);
 
 static void led_thread(void);
-/* prio 8: below esb_thread (7) so LED cannot preempt radio */
-K_THREAD_DEFINE(led_thread_id, 512, led_thread, NULL, NULL, NULL, 8, 0, 0);
+/* below ESB_THREAD_PRIORITY so LED cannot preempt radio */
+K_THREAD_DEFINE(led_thread_id, 512, led_thread, NULL, NULL, NULL, LED_THREAD_PRIORITY, 0, 0);
 
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
 

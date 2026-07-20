@@ -56,7 +56,8 @@ static struct k_work_q rssi_wq;
 static int rssi_wq_init(void)
 {
 	k_work_queue_init(&rssi_wq);
-	k_work_queue_start(&rssi_wq, rssi_wq_stack, K_THREAD_STACK_SIZEOF(rssi_wq_stack), 9, NULL);
+	k_work_queue_start(&rssi_wq, rssi_wq_stack, K_THREAD_STACK_SIZEOF(rssi_wq_stack),
+			   RSSI_WQ_PRIORITY, NULL);
 	k_thread_name_set(&rssi_wq.thread, "rssi_wq");
 	return 0;
 }

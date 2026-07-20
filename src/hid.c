@@ -434,8 +434,8 @@ void hid_reset_all_rssi_smooth(void)
 	memset(rssi_states, 0, sizeof(rssi_states));
 }
 
-/* Below esb_thread (7); must not compete with radio housekeeping. */
-K_THREAD_DEFINE(hid_dropped_reports_logging_thread, 256, hid_dropped_reports_logging, NULL, NULL, NULL, 9, 0, 0);
+/* Below ESB_THREAD_PRIORITY; must not compete with radio housekeeping. */
+K_THREAD_DEFINE(hid_dropped_reports_logging_thread, 256, hid_dropped_reports_logging, NULL, NULL, NULL, HID_DROPPED_REPORTS_LOGGING_PRIORITY, 0, 0);
 
 static void handle_output_report(const uint8_t *buf, uint16_t len)
 {
