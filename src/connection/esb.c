@@ -1227,6 +1227,19 @@ void event_handler(struct esb_evt const *event)
 				break;
 			} break;
 			case ESB_PING_LEN: {
+				/*
+				 * OTA STATUS/FW_INFO share PING length (13). Must not run PING
+				 * clock-bias / TDMA bookkeeping — STATUS bytes 3-6 are seq/bytes,
+				 * not expected_rx_ticks, and ~500 Hz polls would stretch EVENT IRQ
+				 * into ESB RX overflow during tracker OTA.
+				 */
+				if (rx_payload.data[0] == ESB_OTA_STATUS_TYPE ||
+				    rx_payload.data[0] == ESB_OTA_FW_INFO_TYPE) {
+					esb_ota_relay_process_tracker_packet(rx_payload.data,
+									     rx_payload.length);
+					break;
+				}
+
 				LOG_DBG(
 					"Received PING type=%u id=%u ctr=%u",
 					rx_payload.data[0],
@@ -1608,13 +1621,8 @@ void event_handler(struct esb_evt const *event)
 					/* PONG is now built by ack_handler in radio ISR context.
 					 * event_handler only needs to track sequence state. */
 					last_pong_queued_counter[tracker_id] = counter;
-				} else {
-					/* Not a PING packet — check for OTA STATUS (same length) */
-					uint8_t pkt_type = rx_payload.data[0];
-					if (pkt_type == ESB_OTA_STATUS_TYPE || pkt_type == ESB_OTA_FW_INFO_TYPE) {
-						esb_ota_relay_process_tracker_packet(rx_payload.data, rx_payload.length);
-					}
 				}
+				/* Non-PING length-13 OTA types handled at case entry. */
 			} break;
 			case 17: // 16 bytes data + 1 byte sequence number
 			{

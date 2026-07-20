@@ -97,9 +97,10 @@ static bool hid_fifo_try_push(const uint8_t data[16], bool priority)
 	}
 
 	struct hid_fifo_slot *slot = &hid_fifo_slots[pos & HID_FIFO_MASK];
-	/* Capacity check guarantees slot free; seq should already equal pos. */
-	while ((uint32_t)atomic_get(&slot->seq) != pos) {
-	}
+	/*
+	 * Single-core: consume publishes seq before read_pos, so capacity check
+	 * means slot is ready. Never spin here — producers include ESB EVENT IRQ.
+	 */
 	memcpy(slot->data, data, sizeof(slot->data));
 	atomic_set(&slot->seq, (atomic_val_t)(pos + 1));
 	return true;

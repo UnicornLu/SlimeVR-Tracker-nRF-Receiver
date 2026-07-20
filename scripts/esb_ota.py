@@ -91,6 +91,7 @@ TERMINAL_STATUSES = {
     OTA_STATUS_BOARD_MISMATCH,
     OTA_STATUS_SIZE_ERROR,
     OTA_STATUS_FLASH_ERROR,
+    OTA_STATUS_SEQ_ERROR,
 }
 
 # ── OTA Protocol Constants ──────────────────────────────────────────
