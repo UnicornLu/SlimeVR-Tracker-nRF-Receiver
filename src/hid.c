@@ -25,6 +25,8 @@
 #include "connection/esb.h"
 #include "esb_ota.h"
 #include "receiver_ota.h"
+#include "rcv_cmd.h"
+#include "rcv_hid_cmd.h"
 #include "usb.h"
 
 #include <limits.h>
@@ -37,8 +39,7 @@ static struct tracker_report {
 	uint8_t data[16];
 } __packed report = {
 	.data = {0}
-};;
-
+};
 
 #define MAX_REPORTS (MAX_TRACKERS * 4)
 
@@ -115,25 +116,21 @@ uint16_t sent_device_addr = 0;
 int64_t last_registration_sent = 0;
 
 //|type    |description
-//|TX   255|receiver packet 0, associate id and tracker address
-//|TX   254|device list hash, round trip ping
-//|TX   253|receiver status
-//|TX   252|device pairing request
-//|RX   255|round trip response
-//|RX   254|command
+//|TX   255|registration: associate tracker id with device address
+//|RX   254|dongle command envelope (see rcv_hid_cmd.h)
+//|TX   251|dongle command ACK
+//|RX/TX 240-247|HID OTA (see esb_ota.h / receiver_ota.h)
+// Tracker stream types 0-7 are documented near hid_write_packet_n.
 
 //|b0      |b1      |b2      |b3      |b4      |b5      |b6      |b7      |b8      |b9      |b10     |b11     |b12     |b13     |b14     |b15     |
 //|type    |data                                                                                                                                  |
 //|TX   255|id      |device_addr                                          |resv-------------------------------------------------------------------|
-//|TX   254|stored  |crc                                |latency          |resv-------------------------------------------------------------------|
-//|TX   253|status  |resv-------------------------------------------------|resv-------------------------------------------------------------------|
-//|TX   252|id      |device_addr                                          |resv-------------------------------------------------------------------|
-//|RX   255|resv----------------------------------------------------------|resv-------------------------------------------------------------------|
-//|RX   254|command |resv-------------------------------------------------|resv-------------------------------------------------------------------|
+//|TX   251|seq     |opcode  |status  |result---------------------------------------------------------------|
+//|RX   254|seq     |opcode  |flags   |args-----------------------------------------------------------------|
 
 static void packet_device_addr(uint8_t *report, uint16_t id) // associate id and tracker address
 {
-	report[0] = 255; // receiver packet 0
+	report[0] = RCV_HID_TYPE_DEVICE_ADDR;
 	report[1] = id;
 	memcpy(&report[2], &stored_tracker_addr[id], 6);
 	memset(&report[8], 0, 8); // last 8 bytes unused for now
@@ -371,6 +368,14 @@ static void handle_output_report(const uint8_t *buf, uint16_t len)
 		} else {
 			esb_ota_relay_process_hid(buf, len);
 		}
+		return;
+	}
+
+	if (report_type == RCV_HID_TYPE_CMD) {
+		uint8_t ack[RCV_HID_CMD_LEN];
+		if (rcv_cmd_process_hid(buf, len, ack)) {
+			hid_write_packet_n(ack, 0);
+		}
 	}
 }
 
@@ -505,6 +510,11 @@ static void hid_usb_state_changed(bool configured)
 	}
 }
 
+static void hid_async_cmd_ack(const uint8_t ack[RCV_HID_CMD_LEN])
+{
+	hid_write_packet_n(ack, 0);
+}
+
 static int composite_pre_init(void)
 {
 	hdev = DEVICE_DT_GET(DT_NODELABEL(hid_dev_0));
@@ -524,6 +534,7 @@ static int composite_pre_init(void)
 	k_work_init(&report_send, send_report);
 	k_timer_start(&event_timer, REPORT_PERIOD, REPORT_PERIOD);
 	receiver_usb_set_state_callback(hid_usb_state_changed);
+	rcv_cmd_set_async_ack(hid_async_cmd_ack);
 
 	return 0;
 }
@@ -558,7 +569,25 @@ static uint32_t tracker_drops[MAX_TRACKERS] = {0};
 static int64_t last_drop_log_time[MAX_TRACKERS] = {0};
 #define TRACKER_DROP_LOG_INTERVAL_MS 1000  // Log per-tracker drops every 1s
 
-void hid_write_packet_n(uint8_t *data, uint8_t rssi)
+/* byte[1] is a tracker id for stream/registration types, not for cmd/ACK. */
+static bool hid_type_byte1_is_tracker_id(uint8_t type)
+{
+	return type != RCV_HID_TYPE_CMD_ACK && type != RCV_HID_TYPE_CMD;
+}
+
+/* Types that reserve byte[15] for RSSI (not full-quat or OTA payloads). */
+static bool hid_type_has_rssi_slot(uint8_t type)
+{
+	if (type == 1 || type == 4) {
+		return false;
+	}
+	if (type >= 0xF0 && type <= 0xF7) {
+		return false;
+	}
+	return hid_type_byte1_is_tracker_id(type);
+}
+
+void hid_write_packet_n(const uint8_t *data, uint8_t rssi)
 {
 	// Drop packets with all-zero quaternion (type 1 and 4: quat in bytes 2-9).
 	if (data[0] == 1 || data[0] == 4) {
@@ -570,10 +599,7 @@ void hid_write_packet_n(uint8_t *data, uint8_t rssi)
 
 	memcpy(&report.data, data, sizeof(report)); // all data can be passed through
 
-	/* Types 1, 4: full-precision quat+accel — no room for RSSI.
-	 * Types 0xF0-0xF7: OTA reports use all 16 bytes — no room for RSSI. */
-	if (data[0] != 1 && data[0] != 4 &&
-	    !(data[0] >= 0xF0 && data[0] <= 0xF7)) {
+	if (hid_type_has_rssi_slot(data[0])) {
 		uint8_t tracker_id = data[1];
 		uint8_t smoothed_rssi = rssi_smooth_update(tracker_id, (int8_t)rssi);
 		report.data[15] = smoothed_rssi;
@@ -594,16 +620,17 @@ void hid_write_packet_n(uint8_t *data, uint8_t rssi)
 			max_dropped_reports = dropped_reports;
 		}
 
-		// Per-tracker drop tracking and logging
-		uint8_t tracker_id = data[1];
-		if (tracker_id < MAX_TRACKERS) {
-			tracker_drops[tracker_id]++;
-			int64_t now = k_uptime_get();
-			if (now - last_drop_log_time[tracker_id] >= TRACKER_DROP_LOG_INTERVAL_MS) {
-				LOG_WRN("FIFO full: dropped %u packets for tracker %u (write=%zu read=%zu)",
+		if (hid_type_byte1_is_tracker_id(data[0])) {
+			uint8_t tracker_id = data[1];
+			if (tracker_id < MAX_TRACKERS) {
+				tracker_drops[tracker_id]++;
+				int64_t now = k_uptime_get();
+				if (now - last_drop_log_time[tracker_id] >= TRACKER_DROP_LOG_INTERVAL_MS) {
+					LOG_WRN("FIFO full: dropped %u packets for tracker %u (write=%zu read=%zu)",
 						tracker_drops[tracker_id], tracker_id, write_idx, read_idx);
-				last_drop_log_time[tracker_id] = now;
-				tracker_drops[tracker_id] = 0;
+					last_drop_log_time[tracker_id] = now;
+					tracker_drops[tracker_id] = 0;
+				}
 			}
 		}
 		return;
