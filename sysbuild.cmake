@@ -36,9 +36,18 @@ if(SB_CONFIG_BOOTLOADER_MCUBOOT)
   set_property(TARGET mcuboot APPEND PROPERTY _EP_CMAKE_ARGS
                -DBOARD_DEFCONFIG:FILEPATH=${mcuboot_overlay_dir}/mcuboot_board_defconfig)
   list(APPEND mcuboot_EXTRA_DTC_OVERLAY_FILE
-       ${mcuboot_overlay_dir}/mcuboot.overlay)
+       ${mcuboot_overlay_dir}/mcuboot.overlay
+       ${mcuboot_overlay_dir}/mcuboot_boot_mode.overlay)
+  list(APPEND ${DEFAULT_IMAGE}_EXTRA_DTC_OVERLAY_FILE
+       ${mcuboot_overlay_dir}/mcuboot_boot_mode.overlay)
   list(APPEND ${DEFAULT_IMAGE}_EXTRA_CONF_FILE
        ${CMAKE_CURRENT_LIST_DIR}/boards/mcuboot.conf)
+  list(APPEND mcuboot_EXTRA_CONF_FILE
+       ${mcuboot_overlay_dir}/mcuboot_usb_legacy.conf)
+  list(REMOVE_DUPLICATES mcuboot_EXTRA_CONF_FILE)
+  set(mcuboot_EXTRA_CONF_FILE
+      ${mcuboot_EXTRA_CONF_FILE}
+      CACHE INTERNAL "")
   list(REMOVE_DUPLICATES mcuboot_EXTRA_DTC_OVERLAY_FILE)
   set(mcuboot_EXTRA_DTC_OVERLAY_FILE
       ${mcuboot_EXTRA_DTC_OVERLAY_FILE}

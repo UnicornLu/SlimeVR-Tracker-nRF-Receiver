@@ -14,6 +14,9 @@
 #include <hal/nrf_power.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
+#if defined(CONFIG_BOOTLOADER_MCUBOOT)
+#include <zephyr/retention/bootmode.h>
+#endif
 
 #include "system.h"
 
@@ -40,19 +43,19 @@ K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, BUTTON_
 #endif
 
 // DFU support check
-#define DFU_EXISTS ((CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER) && !CONFIG_BOOTLOADER_MCUBOOT)
+#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER || CONFIG_BOOTLOADER_MCUBOOT)
 #define DFU_DBL_RESET_MEM 0x20007F7C
 #define DFU_DBL_RESET_APP 0x4ee5677e
 #define ADAFRUIT_DFU_MAGIC_UF2_RESET 0x57
 #define ADAFRUIT_DFU_MAGIC_OTA_RESET 0xA8
 
-#if DFU_EXISTS
+#if DFU_EXISTS && !CONFIG_BOOTLOADER_MCUBOOT
 static uint32_t *dbl_reset_mem = ((uint32_t *)DFU_DBL_RESET_MEM);
 #endif
 
 void sys_skip_dfu_marker(void)
 {
-#if DFU_EXISTS
+#if DFU_EXISTS && !CONFIG_BOOTLOADER_MCUBOOT
 	(*dbl_reset_mem) = DFU_DBL_RESET_APP;
 	ram_range_retain(dbl_reset_mem, sizeof(*dbl_reset_mem), true);
 #endif
@@ -60,11 +63,20 @@ void sys_skip_dfu_marker(void)
 
 void sys_enter_dfu(bool ota)
 {
-#if CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT
+#if defined(CONFIG_BOOTLOADER_MCUBOOT)
+	ARG_UNUSED(ota);
+	int err = bootmode_set(BOOT_MODE_TYPE_BOOTLOADER);
+	if (err) {
+		LOG_ERR("Failed to request MCUboot recovery: %d", err);
+		return;
+	}
+	LOG_INF("MCUboot serial recovery requested");
+	sys_request_system_reboot();
+#elif CONFIG_BUILD_OUTPUT_UF2
 	NRF_POWER->GPREGRET = ota ? ADAFRUIT_DFU_MAGIC_OTA_RESET : ADAFRUIT_DFU_MAGIC_UF2_RESET;
 	k_msleep(100);
 	sys_request_system_reboot();
-#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER && !CONFIG_BOOTLOADER_MCUBOOT
+#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER
 	ARG_UNUSED(ota);
 	const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 	if (device_is_ready(gpio_dev)) {

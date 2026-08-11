@@ -5,5 +5,5 @@
 };
 
 &zephyr_udc0 {
-	status = "disabled";
+	status = "okay";
 };
