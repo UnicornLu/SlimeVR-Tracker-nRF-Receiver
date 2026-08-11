@@ -48,7 +48,7 @@ static void console_thread(void);
 /* below ESB_THREAD_PRIORITY; console must not preempt radio housekeeping */
 K_THREAD_DEFINE(console_thread_id, 1024, console_thread, NULL, NULL, NULL, CONSOLE_THREAD_PRIORITY, 0, 0);
 
-#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER)
+#define DFU_EXISTS ((CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER) && !CONFIG_BOOTLOADER_MCUBOOT)
 
 static const char *meows[] = {
 	"Mew", "Meww", "Meow", "Meow meow", "Mrrrp", "Mrrf", "Mreow", "Mrrrow", "Mrrr", "Purr",

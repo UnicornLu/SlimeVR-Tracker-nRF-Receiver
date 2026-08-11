@@ -40,13 +40,15 @@ K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, BUTTON_
 #endif
 
 // DFU support check
-#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER)
+#define DFU_EXISTS ((CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER) && !CONFIG_BOOTLOADER_MCUBOOT)
 #define DFU_DBL_RESET_MEM 0x20007F7C
 #define DFU_DBL_RESET_APP 0x4ee5677e
 #define ADAFRUIT_DFU_MAGIC_UF2_RESET 0x57
 #define ADAFRUIT_DFU_MAGIC_OTA_RESET 0xA8
 
+#if DFU_EXISTS
 static uint32_t *dbl_reset_mem = ((uint32_t *)DFU_DBL_RESET_MEM);
+#endif
 
 void sys_skip_dfu_marker(void)
 {
@@ -58,11 +60,11 @@ void sys_skip_dfu_marker(void)
 
 void sys_enter_dfu(bool ota)
 {
-#if CONFIG_BUILD_OUTPUT_UF2
+#if CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT
 	NRF_POWER->GPREGRET = ota ? ADAFRUIT_DFU_MAGIC_OTA_RESET : ADAFRUIT_DFU_MAGIC_UF2_RESET;
 	k_msleep(100);
 	sys_request_system_reboot();
-#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER && !CONFIG_BOOTLOADER_MCUBOOT
 	ARG_UNUSED(ota);
 	const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 	if (device_is_ready(gpio_dev)) {
