@@ -1,35 +1,23 @@
-set(pm_static_dir ${CMAKE_CURRENT_LIST_DIR}/pm_static)
+set(partition_overlay_dir ${CMAKE_CURRENT_LIST_DIR}/dts/partitions)
+set(partition_overlay)
 
-set(pm_static_override_candidates)
-
-if(DEFINED SB_CONFIG_BOARD_QUALIFIERS AND NOT SB_CONFIG_BOARD_QUALIFIERS STREQUAL "")
-  string(REPLACE "/" "_" pm_static_board_qualifiers ${SB_CONFIG_BOARD_QUALIFIERS})
-  list(APPEND pm_static_override_candidates
-    ${pm_static_dir}/pm_static_${SB_CONFIG_BOARD}_${pm_static_board_qualifiers}.yml
-    ${pm_static_dir}/${SB_CONFIG_BOARD}_${pm_static_board_qualifiers}.yml
-  )
+if(DEFINED EXTRA_DTC_OVERLAY_FILE)
+  list(APPEND ${DEFAULT_IMAGE}_EXTRA_DTC_OVERLAY_FILE ${EXTRA_DTC_OVERLAY_FILE})
 endif()
 
-list(APPEND pm_static_override_candidates
-  ${pm_static_dir}/pm_static_${SB_CONFIG_BOARD}.yml
-  ${pm_static_dir}/${SB_CONFIG_BOARD}.yml
-)
-
-foreach(pm_static_override_candidate ${pm_static_override_candidates})
-  if(EXISTS ${pm_static_override_candidate})
-    set(PM_STATIC_YML_FILE ${pm_static_override_candidate} CACHE INTERNAL "")
-    break()
-  endif()
-endforeach()
-
-if(DEFINED PM_STATIC_YML_FILE)
-  return()
-elseif(SB_CONFIG_BOARD STREQUAL "xiao_ble")
-  set(PM_STATIC_YML_FILE ${pm_static_dir}/nrf52840_xiao.yml CACHE INTERNAL "")
+if(SB_CONFIG_BOARD STREQUAL "xiao_ble")
+  set(partition_overlay ${partition_overlay_dir}/nrf52840_xiao.overlay)
 elseif(SB_CONFIG_BOARD MATCHES "^nrf52840dongle$|^holyiot_21017$")
-  set(PM_STATIC_YML_FILE ${pm_static_dir}/nrf52840_dongle.yml CACHE INTERNAL "")
+  set(partition_overlay ${partition_overlay_dir}/nrf52840_dongle.overlay)
 elseif(SB_CONFIG_SOC_NRF52833)
-  set(PM_STATIC_YML_FILE ${pm_static_dir}/nrf52833_uf2.yml CACHE INTERNAL "")
+  set(partition_overlay ${partition_overlay_dir}/nrf52833_uf2.overlay)
 elseif(SB_CONFIG_SOC_NRF52840)
-  set(PM_STATIC_YML_FILE ${pm_static_dir}/nrf52840_uf2.yml CACHE INTERNAL "")
+  set(partition_overlay ${partition_overlay_dir}/nrf52840_uf2.overlay)
+endif()
+
+if(partition_overlay)
+  list(APPEND ${DEFAULT_IMAGE}_EXTRA_DTC_OVERLAY_FILE ${partition_overlay})
+  set(${DEFAULT_IMAGE}_EXTRA_DTC_OVERLAY_FILE
+      ${${DEFAULT_IMAGE}_EXTRA_DTC_OVERLAY_FILE}
+      CACHE INTERNAL "")
 endif()
