@@ -1,9 +1,0 @@
-# Copyright (c) 2024 Nordic Semiconductor ASA
-# SPDX-License-Identifier: Apache-2.0
-
-board:
-  name: kounolab_dongle_uf2
-  full_name: Stella
-  vendor: kounolab
-  socs:
-    - name: nrf52820
