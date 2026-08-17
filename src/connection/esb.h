@@ -33,12 +33,33 @@
 #define ESB_PONG_LEN 13
 #define ESB_MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
 #define ESB_COMPOSITE_TYPE 0xFE // Composite packet containing multiple sub-packets
-// Preferred ESB channels: even channels outside WiFi/BT-heavy spectrum
-// (upstream SlimeVR selection). Reference table for channel picking
-// (see esb.c for the array itself).
+
+// Reference table for channel picking (see esb.c for the array itself).
 bool esb_channel_is_allowed(uint8_t channel);
 
+/* ---------------------------------------------------------------------------
+ * RF channel storage encoding (NVS byte). User-facing channel is 0-100.
+ *   0xFF -> default channel;  0 -> invalid/legacy -> default;
+ *   128  -> channel 0;        1..100 -> channel value.
+ * Keeps 0 unambiguous as "no setting" across firmware upgrades. */
+#define ESB_RF_CHANNEL_DEFAULT 0xFF
+#define ESB_RF_CHANNEL_ZERO_ENC 128
 
+static inline uint8_t esb_rf_channel_encode(uint8_t channel)
+{
+	return channel == 0 ? ESB_RF_CHANNEL_ZERO_ENC : channel;
+}
+
+static inline uint8_t esb_rf_channel_decode(uint8_t stored)
+{
+	if (stored == ESB_RF_CHANNEL_ZERO_ENC) {
+		return 0; /* channel 0 */
+	}
+	if (stored == ESB_RF_CHANNEL_DEFAULT || stored == 0 || stored > 100) {
+		return ESB_RF_CHANNEL_DEFAULT; /* default (incl. legacy/invalid) */
+	}
+	return stored;
+}
 // Remote command flags for PONG data[7]
 #define ESB_PONG_FLAG_NORMAL 0x00
 #define ESB_PONG_FLAG_SHUTDOWN 0x01

@@ -167,7 +167,7 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 		cmd_name = "Fusion reset";
 	} else if (strcmp(arg2, "channel") == 0) {
 		if (!arg3) {
-			printk("Usage: send all channel <1-100>\n");
+			printk("Usage: send all channel <0-100>\n");
 			printk("Example: send all channel 25 - Set all active trackers to channel 25\n");
 			return;
 		}
@@ -175,8 +175,8 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 		char *endptr;
 		long channel = strtol(arg3, &endptr, 10);
 
-		if (*endptr != '\0' || channel < 1 || channel > 100) {
-			printk("Invalid channel. Must be a number between 1 and 100.\n");
+		if (*endptr != '\0' || channel < 0 || channel > 100) {
+			printk("Invalid channel. Must be a number between 0 and 100.\n");
 			return;
 		}
 

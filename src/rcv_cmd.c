@@ -155,7 +155,7 @@ uint8_t rcv_cmd_list(void)
 
 uint8_t rcv_cmd_channel_set(uint8_t channel)
 {
-	if (channel < 1 || channel > 100) {
+	if (channel > 100) {
 		return RCV_HID_ST_EINVAL;
 	}
 	esb_set_receiver_channel(channel);
@@ -190,7 +190,7 @@ uint8_t rcv_cmd_info(void)
 	printk("\nDevice address: %012llX\n", *(uint64_t *)NRF_FICR->DEVICEADDR & 0xFFFFFFFFFFFF);
 
 	uint8_t current_channel = esb_get_receiver_channel();
-	if (current_channel != 0xFF && current_channel <= 100) {
+	if (current_channel != ESB_RF_CHANNEL_DEFAULT) {
 		printk("RF Channel: %u (custom)\n", current_channel);
 	} else {
 		printk("RF Channel: %u (default)\n", CONFIG_RADIO_RF_CHANNEL);
@@ -543,7 +543,7 @@ static int map_esb_channel_err(int err)
 
 uint8_t rcv_cmd_tracker_channel_all(uint8_t channel)
 {
-	if (channel < 1 || channel > 100) {
+	if (channel > 100) {
 		return RCV_HID_ST_EINVAL;
 	}
 	return (uint8_t)map_esb_channel_err(esb_set_all_trackers_channel(channel));

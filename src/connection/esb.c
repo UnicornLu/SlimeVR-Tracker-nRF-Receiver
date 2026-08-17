@@ -1921,8 +1921,11 @@ int esb_initialize(bool tx)
 	err = esb_init(&config);
 
 	if (!err) {
-		// Use saved channel if available, otherwise use default
-		uint8_t channel_to_use = (receiver_rf_channel <= 100) ? receiver_rf_channel : RADIO_RF_CHANNEL;
+		// Use saved channel if available, otherwise use default (stored is encoded)
+		uint8_t channel_to_use = esb_rf_channel_decode(receiver_rf_channel);
+		if (channel_to_use == ESB_RF_CHANNEL_DEFAULT) {
+			channel_to_use = RADIO_RF_CHANNEL;
+		}
 		err = esb_set_rf_channel(channel_to_use);
 		LOG_INF("Set RF channel to %u", channel_to_use);
 	}
@@ -2605,8 +2608,8 @@ static void channel_change_finish(bool success)
 // Sets the RF channel for all trackers
 int esb_set_all_trackers_channel(uint8_t channel)
 {
-	if (channel < 1 || channel > 100) {
-		LOG_ERR("Invalid channel value: %u (must be 1-100)", channel);
+	if (channel > 100) {
+		LOG_ERR("Invalid channel value: %u (must be 0-100)", channel);
 		return -EINVAL;
 	}
 
@@ -2615,8 +2618,8 @@ int esb_set_all_trackers_channel(uint8_t channel)
 		return -EBUSY;
 	}
 
-	tracker_channel_value = channel;
-	pending_channel = channel;
+	tracker_channel_value = channel;   /* wire value: user semantics 0-100 */
+	pending_channel = esb_rf_channel_encode(channel); /* stored: 0 -> 128 */
 	channel_change_timeout = k_uptime_get() + CHANNEL_CHANGE_TIMEOUT_MS;
 	// Clear mask before setting the pending flag to avoid losing confirmations
 	// that arrive between the flag set and the mask clear.
@@ -2636,7 +2639,7 @@ int esb_clear_all_trackers_channel(void)
 		return -EBUSY;
 	}
 
-	pending_channel = 0xFF; // Special value to indicate clearing
+	pending_channel = ESB_RF_CHANNEL_DEFAULT; /* clear -> default */
 	channel_change_timeout = k_uptime_get() + CHANNEL_CHANGE_TIMEOUT_MS;
 	// Clear mask before setting the pending flag to avoid losing confirmations
 	// that arrive between the flag set and the mask clear.
@@ -2651,13 +2654,13 @@ int esb_clear_all_trackers_channel(void)
 // Set the receiver's RF channel (local, does not affect trackers)
 void esb_set_receiver_channel(uint8_t channel)
 {
-	if (channel < 1 || channel > 100) {
-		LOG_ERR("Invalid channel value: %u (must be 1-100)", channel);
+	if (channel > 100) {
+		LOG_ERR("Invalid channel value: %u (must be 0-100)", channel);
 		return;
 	}
 
 	LOG_INF("Setting receiver RF channel to %u (local only)", channel);
-	receiver_rf_channel = channel;
+	receiver_rf_channel = esb_rf_channel_encode(channel); /* stored: 0 -> 128 */
 
 	// Save to NVS
 	sys_write(RF_CHANNEL, NULL, &receiver_rf_channel, sizeof(receiver_rf_channel));
@@ -2667,14 +2670,14 @@ void esb_set_receiver_channel(uint8_t channel)
 	esb_initialize(false);
 	esb_start_rx();
 
-	LOG_INF("Receiver channel switched to %u", receiver_rf_channel);
+	LOG_INF("Receiver channel switched to %u", channel);
 }
 
 // Clear the receiver's RF channel setting (local, does not affect trackers)
 void esb_clear_receiver_channel(void)
 {
 	LOG_INF("Clearing receiver RF channel (local only)");
-	receiver_rf_channel = 0xFF;
+	receiver_rf_channel = ESB_RF_CHANNEL_DEFAULT;
 
 	// Clear from NVS
 	sys_write(RF_CHANNEL, NULL, &receiver_rf_channel, sizeof(receiver_rf_channel));
@@ -2687,10 +2690,10 @@ void esb_clear_receiver_channel(void)
 	LOG_INF("Receiver channel cleared, using default");
 }
 
-// Get the receiver's RF channel
+// Get the receiver's RF channel (decoded: 0xFF = default)
 uint8_t esb_get_receiver_channel(void)
 {
-	return receiver_rf_channel;
+	return esb_rf_channel_decode(receiver_rf_channel);
 }
 
 // Set up unified addresses: pipe 0 for discovery (pairing), pipes 1-7 for paired data
@@ -2721,21 +2724,16 @@ static void esb_thread(void)
 	}
 	k_mutex_unlock(&tracker_store_lock);
 
-	// Load saved RF channel from NVS if exists
+	// Load saved RF channel from NVS if exists (stored value is encoded).
 	uint8_t saved_channel = 0xFF;
 	sys_read(RF_CHANNEL, &saved_channel, sizeof(saved_channel));
-	// 0xFF and 0 both indicate "use default"
-	if (saved_channel != 0xFF && saved_channel != 0 && saved_channel <= 100) {
-		// Valid saved channel found, use it
+	uint8_t decoded = esb_rf_channel_decode(saved_channel);
+	if (decoded != ESB_RF_CHANNEL_DEFAULT) {
 		receiver_rf_channel = saved_channel;
-		LOG_INF("Loaded RF channel %u from NVS", saved_channel);
+		LOG_INF("Loaded RF channel %u from NVS", decoded);
 	} else {
+		receiver_rf_channel = ESB_RF_CHANNEL_DEFAULT;
 		LOG_INF("No saved RF channel, using default %u", RADIO_RF_CHANNEL);
-		// If channel was 0 (uninitialized), write 0xFF to NVS
-		if (saved_channel == 0) {
-			saved_channel = 0xFF;
-			sys_write(RF_CHANNEL, NULL, &saved_channel, sizeof(saved_channel));
-		}
 	}
 
 	LOG_INF("%d/%d devices stored", tracker_count, MAX_TRACKERS);
@@ -2837,10 +2835,11 @@ static void esb_thread(void)
 
 			if (current_mask == expected_mask) {
 				// All trackers confirmed, switch receiver channel
-				if (pending_channel == 0xFF) {
+				uint8_t new_ch = esb_rf_channel_decode(pending_channel);
+				if (new_ch == ESB_RF_CHANNEL_DEFAULT) {
 					// Clear channel setting
 					LOG_INF("All trackers confirmed channel clear, restoring receiver to default");
-					receiver_rf_channel = 0xFF;
+					receiver_rf_channel = ESB_RF_CHANNEL_DEFAULT;
 
 					// Clear from NVS
 					sys_write(RF_CHANNEL, NULL, &receiver_rf_channel, sizeof(receiver_rf_channel));
@@ -2853,8 +2852,8 @@ static void esb_thread(void)
 
 					LOG_INF("Receiver channel cleared, using default %u", RADIO_RF_CHANNEL);
 				} else {
-					// Set new channel
-					LOG_INF("All trackers confirmed channel change to %u, switching receiver", pending_channel);
+					// Set new channel (pending_channel already stored-encoded)
+					LOG_INF("All trackers confirmed channel change to %u, switching receiver", new_ch);
 					receiver_rf_channel = pending_channel;
 
 					// Save to NVS
@@ -2866,7 +2865,7 @@ static void esb_thread(void)
 					esb_initialize(false);
 					esb_start_rx();
 
-					LOG_INF("Receiver channel switched to %u successfully", receiver_rf_channel);
+					LOG_INF("Receiver channel switched to %u successfully", new_ch);
 				}
 
 				channel_change_finish(true);

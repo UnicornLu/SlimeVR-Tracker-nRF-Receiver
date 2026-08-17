@@ -108,7 +108,7 @@ static void print_help(void)
 
 	printk(
 		"RF Channel (Local Receiver):\n"
-		"  channel <1-100>            Set receiver RF channel only\n"
+		"  channel <0-100>            Set receiver RF channel only\n"
 		"    Example: channel 25       Set receiver to channel 25\n"
 		"  clearchannel               Clear receiver RF channel (use default)\n"
 		"\n"
@@ -116,7 +116,7 @@ static void print_help(void)
 
 	printk(
 		"RSSI / Channel Scan:\n"
-		"  rssi_scan                  Scan RSSI across channels 1-100 and print a recommended channel\n"
+		"  rssi_scan                  Scan RSSI across preferred channels and print a recommendation\n"
 		"\n"
 	);
 
@@ -125,7 +125,7 @@ static void print_help(void)
 		"  send <id|all> <command>    Send remote command to tracker(s)\n"
 		"    Commands: shutdown, calibrate, 6-side, meow, scan,\n"
 		"              mag <on|off|clear|cal|auto on|auto off>, reboot, clear, dfu [ota],\n"
-		"              channel <1-100>, clearchannel,\n"
+		"              channel <0-100>, clearchannel,\n"
 		"              sens <x,y,z|reset|auto <x|y|z> [rev]>,\n"
 		"              reset <zro|acc|bat|mag|tcal|fusion>, ping\n"
 	);
@@ -390,14 +390,14 @@ static void console_thread(void)
 			}
 		} else if (strcmp(argv[0], command_channel) == 0) {
 			if (!arg) {
-				printk("Usage: channel <1-100>\n");
+				printk("Usage: channel <0-100>\n");
 				printk("Example: channel 25 - Set receiver RF channel to 25 (local only)\n");
 			} else {
 				char *endptr;
 				long channel = strtol(arg, &endptr, 10);
 
-				if (*endptr != '\0' || channel < 1 || channel > 100) {
-					printk("Invalid channel. Must be a number between 1 and 100.\n");
+				if (*endptr != '\0' || channel < 0 || channel > 100) {
+					printk("Invalid channel. Must be a number between 0 and 100.\n");
 				} else if (rcv_cmd_channel_set((uint8_t)channel) == RCV_HID_ST_OK) {
 					printk("Receiver RF channel set to %d (local only)\n", (int)channel);
 				}
