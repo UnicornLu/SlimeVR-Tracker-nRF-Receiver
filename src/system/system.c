@@ -2,7 +2,7 @@
 #include "connection/esb.h"
 #include "system/led.h"
 #include "system/status.h"
-#include "retained.h"
+#include <hal/nrf_power.h>
 
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pwm.h>
@@ -44,20 +44,14 @@ K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, BUTTON_
 
 // DFU support check
 #define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER || CONFIG_BOOTLOADER_MCUBOOT)
-#define DFU_DBL_RESET_MEM 0x20007F7C
-#define DFU_DBL_RESET_APP 0x4ee5677e
 #define ADAFRUIT_DFU_MAGIC_UF2_RESET 0x57
 #define ADAFRUIT_DFU_MAGIC_OTA_RESET 0xA8
-
-#if DFU_EXISTS && !CONFIG_BOOTLOADER_MCUBOOT
-static uint32_t *dbl_reset_mem = ((uint32_t *)DFU_DBL_RESET_MEM);
-#endif
+#define ADAFRUIT_DFU_MAGIC_SKIP 0x6D
 
 void sys_skip_dfu_marker(void)
 {
 #if DFU_EXISTS && !CONFIG_BOOTLOADER_MCUBOOT
-	(*dbl_reset_mem) = DFU_DBL_RESET_APP;
-	ram_range_retain(dbl_reset_mem, sizeof(*dbl_reset_mem), true);
+	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP; // Skip DFU
 #endif
 }
 
