@@ -33,6 +33,11 @@
 #define ESB_PONG_LEN 13
 #define ESB_MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
 #define ESB_COMPOSITE_TYPE 0xFE // Composite packet containing multiple sub-packets
+// Preferred ESB channels: even channels outside WiFi/BT-heavy spectrum
+// (upstream SlimeVR selection). Reference table for channel picking
+// (see esb.c for the array itself).
+bool esb_channel_is_allowed(uint8_t channel);
+
 
 // Remote command flags for PONG data[7]
 #define ESB_PONG_FLAG_NORMAL 0x00

@@ -67,6 +67,25 @@ LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 #define RADIO_RETRANSMIT_DELAY CONFIG_RADIO_RETRANSMIT_DELAY
 #define RADIO_RF_CHANNEL CONFIG_RADIO_RF_CHANNEL
 #define PAIRING_TIMEOUT_SECONDS CONFIG_PAIRING_TIMEOUT
+/* Preferred ESB channels (upstream SlimeVR selection): even channels outside
+ * WiFi/BT-heavy spectrum. Reference for future auto channel-picking. */
+static const uint8_t esb_allowed_channels[] = {
+	0, 2, 52, 72, 74, 76, 78, 82, 84, 86, 88, 50, 24, 48,
+	70, 68, 46, 44, 20, 54, 56, 28, 30,
+	6, 8, 10, 12, 14, 16, 18, 32, 34,
+	36, 38, 40, 42, 58, 60, 62, 64, 66,
+};
+
+bool esb_channel_is_allowed(uint8_t channel)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(esb_allowed_channels); i++) {
+		if (esb_allowed_channels[i] == channel) {
+			return true;
+		}
+	}
+	return false;
+}
+
 
 // TDMA parameters — now dynamically computed based on active tracker count.
 // The receiver periodically scans for active trackers and packs per-tracker
