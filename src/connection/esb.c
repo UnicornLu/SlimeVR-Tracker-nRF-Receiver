@@ -443,12 +443,14 @@ struct tdma_stats {
 	uint32_t violations;
 	int32_t phase_ema_q8;
 	bool phase_initialized;
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
 	uint32_t phase_hist[RX_PHASE_BUCKETS];
 	uint32_t raw_phase_hist[RX_PHASE_BUCKETS];
 	int32_t raw_min_offset;
 	int32_t raw_max_offset;
 	uint32_t rssi_hist[RX_RSSI_BUCKETS];
 	uint32_t rssi_count;
+#endif
 };
 
 
@@ -594,11 +596,13 @@ static void tdma_check_slot(uint8_t tracker_id, uint32_t rx_ticks, int8_t rssi)
 		ref_offset += frame_ticks;
 	}
 
-	/* Update receiver-time phase and RSSI distributions. */
 	struct tdma_stats *stats = &g_tdma_stats[tracker_id];
 	stats->count++;
+
+	/* Update receiver-time phase and RSSI distributions. */
 	stats->sum_offset += ref_offset;
 	stats->sum_sq_offset += ((int64_t)ref_offset * ref_offset);
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
 	uint32_t phase_bucket = (uint32_t)CLAMP(ref_offset - RX_PHASE_MIN_TICKS, 0, RX_PHASE_BUCKETS - 1);
 	stats->phase_hist[phase_bucket]++;
 	uint32_t raw_phase_bucket
@@ -609,18 +613,26 @@ static void tdma_check_slot(uint8_t tracker_id, uint32_t rx_ticks, int8_t rssi)
 	uint32_t rssi_bucket = MIN((uint32_t)(uint8_t)rssi, RX_RSSI_MAX_DBM);
 	stats->rssi_hist[rssi_bucket]++;
 	stats->rssi_count++;
+#endif
+	ARG_UNUSED(rssi);
+	ARG_UNUSED(raw_offset);
 
 	if (stats->count == 1) {
 		stats->min_offset = ref_offset;
 		stats->max_offset = ref_offset;
-		stats->raw_min_offset = raw_offset;
-		stats->raw_max_offset = raw_offset;
 	} else {
 		stats->min_offset = MIN(stats->min_offset, ref_offset);
 		stats->max_offset = MAX(stats->max_offset, ref_offset);
+	}
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+	if (stats->count == 1) {
+		stats->raw_min_offset = raw_offset;
+		stats->raw_max_offset = raw_offset;
+	} else {
 		stats->raw_min_offset = MIN(stats->raw_min_offset, raw_offset);
 		stats->raw_max_offset = MAX(stats->raw_max_offset, raw_offset);
 	}
+#endif
 
 	/*
 	 * Phase-consistency violation detection.
