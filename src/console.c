@@ -100,6 +100,7 @@ static void print_help(void)
 
 	printk(
 		"Statistics:\n"
+		"  health                     Print one non-resetting receiver health snapshot\n"
 		"  stats                      Toggle detailed packet statistics\n"
 		"  stats <seconds>            Show detailed stats for N seconds\n"
 		"  resetstats                 Reset packet statistics\n"
@@ -259,6 +260,7 @@ static void console_thread(void)
 	const char command_exit[] = "exit";
 	const char command_clear[] = "clear";
 	const char command_stats[] = "stats";
+	const char command_health[] = "health";
 	const char command_resetstats[] = "resetstats";
 	const char command_channel[] = "channel";
 	const char command_clearchannel[] = "clearchannel";
@@ -351,6 +353,12 @@ static void console_thread(void)
 			rcv_cmd_exit_pair();
 		} else if (strcmp(argv[0], command_clear) == 0) {
 			rcv_cmd_clear();
+		} else if (strcmp(argv[0], command_health) == 0) {
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+			esb_print_health_snapshot();
+#else
+			printk("health requires CONFIG_TDMA_DIAGNOSTICS=y\n");
+#endif
 		} else if (strcmp(argv[0], command_stats) == 0) {
 			if (!arg) {
 				rcv_cmd_stats(0);
