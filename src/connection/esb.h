@@ -156,6 +156,13 @@ uint32_t esb_get_stats_detailed_remaining(void);        // Get remaining time (0
 void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag);
 /* Active-scan then queue. Returns bitmask of targeted tracker ids. Blocks ~1s. */
 uint32_t esb_send_remote_command_all(uint8_t command_flag);
+/* Targeted test commands: publish TPS, then queue the flag. Return the
+ * targeted-tracker bitmask; invalidate sticky-all state. */
+uint32_t esb_send_remote_command_test_on(uint8_t tracker_id, uint16_t tps);
+uint32_t esb_send_remote_command_test_off(uint8_t tracker_id);
+/* Active-scan then queue. Return bitmask of targeted tracker ids. Blocks ~1s. */
+uint32_t esb_send_remote_command_test_on_all(uint16_t tps);
+uint32_t esb_send_remote_command_test_off_all(void);
 void esb_send_remote_command_sens(uint8_t tracker_id, float x, float y, float z);
 bool esb_send_remote_command_sens_auto(uint8_t tracker_id, uint8_t axis, uint16_t revolutions);
 /* Active-scan then queue. Returns bitmask of targeted tracker ids. Blocks ~1s. */

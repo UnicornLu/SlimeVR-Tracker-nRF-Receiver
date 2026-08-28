@@ -136,9 +136,22 @@ static uint8_t packet_count[MAX_TRACKERS] = {0};             // Packet count rec
 // On single-core Cortex-M, volatile ensures visibility between ISR priorities.
 static volatile uint8_t tracker_remote_command[MAX_TRACKERS]; // Command flag for next PONG
 static volatile uint32_t tracker_channel_value;               // Channel value for SET_CHANNEL command
+static volatile uint16_t tracker_test_on_tps[MAX_TRACKERS];   // Optional TPS carried by TEST_MODE_ON
 static volatile int16_t pending_sens_data[MAX_TRACKERS][3];   // SENS_SET sensitivity data
 static volatile uint8_t pending_sens_auto_axis[MAX_TRACKERS];
 static volatile uint16_t pending_sens_auto_revolutions[MAX_TRACKERS];
+/* Sticky state for commands addressed to "all": newly active trackers must
+ * converge to the same test on/off state. Confirmed means the tracker has
+ * executed and acknowledged the current desired state. */
+static atomic_t test_all_state_valid;
+static atomic_t test_all_enabled;
+static atomic_t test_all_broadcasting;
+static atomic_t test_all_confirmed_mask;
+static volatile uint16_t test_all_requested_tps;
+static volatile uint16_t test_all_effective_tps;
+static atomic_t test_all_ready_after_ms[MAX_TRACKERS];
+static atomic_t test_all_generation; /* bumped by every test command; stale broadcasts abort */
+static K_MUTEX_DEFINE(test_all_mutex); /* serializes whole all-target helper bodies */
 static uint8_t receiver_rf_channel = 0xFF; // Current RF channel of the receiver, 0xFF indicates using default value
 
 #define PING_TIMEOUT_MS 5000               // PING timeout threshold: 5 seconds
@@ -267,12 +280,168 @@ static void tdma_shadow_update(uint32_t now_ms)
 	atomic_set(&tdma_shadow_pending_leave_mask, (atomic_val_t)pending_leave_mask);
 }
 
+#define TEST_ALL_RATE_QUANTUM_TPS 10U
+#define TEST_ALL_JOIN_CONFIG_GRACE_MS 1500
+
+static uint16_t test_all_capacity_tps(uint8_t active_count)
+{
+	if (active_count == 0) {
+		return 1000;
+	}
+	uint16_t capacity = (uint16_t)(32768U / (TDMA_BASE_SLOT_TICKS * active_count));
+	uint16_t clamped = (capacity / TEST_ALL_RATE_QUANTUM_TPS) * TEST_ALL_RATE_QUANTUM_TPS;
+	return clamped > 0 ? clamped : 1;
+}
+
+static uint16_t test_all_requested_value(void)
+{
+	return test_all_requested_tps == 0 ? 100 : test_all_requested_tps;
+}
+
+static uint16_t test_all_wire_tps(void)
+{
+	/* Preserve zero as the protocol spelling of the built-in 100 TPS default. */
+	return test_all_requested_tps == 0 ? 0 : test_all_effective_tps;
+}
+
+/* Any targeted (per-tracker) TEST_MODE_ON/OFF command supersedes sticky-all
+ * policy: stop reconciling, drop stale confirmations, and release the
+ * broadcast guard so an in-flight all-command cannot keep suppressing it. */
+static void test_all_invalidate(void)
+{
+	atomic_set(&test_all_state_valid, 0);
+	atomic_set(&test_all_confirmed_mask, 0);
+	atomic_set(&test_all_broadcasting, 0);
+}
+
+/* After a restart or a >5s PING gap: drop the sticky confirmation, park a
+ * pending test flag as NORMAL so the next PONG delivers a clean TDMA config
+ * first, and arm the join grace; reconciliation re-queues afterwards. */
+static void test_all_invalidate_tracker(uint8_t tracker_id, int64_t now_ms)
+{
+	uint8_t pending_cmd = tracker_remote_command[tracker_id];
+	if (pending_cmd == ESB_PONG_FLAG_TEST_MODE_ON || pending_cmd == ESB_PONG_FLAG_TEST_MODE_OFF) {
+		tracker_remote_command[tracker_id] = ESB_PONG_FLAG_NORMAL;
+	}
+	atomic_and(&test_all_confirmed_mask, (atomic_val_t)~BIT(tracker_id));
+	atomic_set(&test_all_ready_after_ms[tracker_id], (atomic_val_t)((uint32_t)now_ms + TEST_ALL_JOIN_CONFIG_GRACE_MS));
+}
+
+static void test_all_update_effective(uint8_t active_count, int64_t now, bool layout_changed)
+{
+	if (!atomic_get(&test_all_state_valid) || !atomic_get(&test_all_enabled)) {
+		return;
+	}
+	uint16_t requested = test_all_requested_value();
+	uint16_t effective = MIN(requested, test_all_capacity_tps(active_count));
+	if (effective == test_all_effective_tps) {
+		return;
+	}
+	test_all_effective_tps = effective;
+	uint32_t active_mask = tdma_active_mask;
+	atomic_and(&test_all_confirmed_mask, (atomic_val_t)~active_mask);
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		if (!(active_mask & BIT(i))) {
+			continue;
+		}
+		tracker_test_on_tps[i] = test_all_wire_tps();
+		atomic_set(
+			&test_all_ready_after_ms[i],
+			(atomic_val_t)((uint32_t)now + (layout_changed ? TEST_ALL_JOIN_CONFIG_GRACE_MS : 0))
+		);
+	}
+	LOG_INF(
+		"Sticky TEST_MODE_ON reclamp: requested=%u effective=%u active=%u capacity=%u",
+		requested,
+		effective,
+		active_count,
+		test_all_capacity_tps(active_count)
+	);
+}
+
+static void test_all_note_layout(uint32_t old_mask, uint32_t new_mask, int64_t now)
+{
+	if (!atomic_get(&test_all_state_valid)) {
+		return;
+	}
+	uint32_t joined_mask = new_mask & ~old_mask;
+	if (joined_mask == 0) {
+		return;
+	}
+	atomic_and(&test_all_confirmed_mask, (atomic_val_t)~joined_mask);
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		if (joined_mask & BIT(i)) {
+			/* Refresh the joined tracker's TPS even on a same-count swap:
+			 * update_effective skips unchanged effective rates. */
+			if (atomic_get(&test_all_enabled)) {
+				tracker_test_on_tps[i] = test_all_wire_tps();
+			}
+			/* First allow a NORMAL PONG to deliver the new TDMA layout;
+			 * then converge the newly active tracker to test all state. */
+			atomic_set(&test_all_ready_after_ms[i], (atomic_val_t)((uint32_t)now + TEST_ALL_JOIN_CONFIG_GRACE_MS));
+		}
+	}
+}
+
+static void test_all_reconcile(int64_t now)
+{
+	if (!atomic_get(&test_all_state_valid) || atomic_get(&test_all_broadcasting)) {
+		return;
+	}
+	bool enabled = atomic_get(&test_all_enabled) != 0;
+	uint8_t command = enabled ? ESB_PONG_FLAG_TEST_MODE_ON : ESB_PONG_FLAG_TEST_MODE_OFF;
+	uint32_t queued_mask = 0;
+	uint16_t requested = 0;
+	uint16_t effective = 0;
+	/* Same critical section as the test commands: the publication decision
+	 * and TPS/flag writes are atomic against targeted supersede. */
+	unsigned int key = irq_lock();
+	if (atomic_get(&test_all_state_valid) && !atomic_get(&test_all_broadcasting)) {
+		uint32_t pending_mask = tdma_active_mask
+			& ~(uint32_t)atomic_get(&test_all_confirmed_mask);
+		for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+			uint32_t ready_after = (uint32_t)atomic_get(&test_all_ready_after_ms[i]);
+			if (!(pending_mask & BIT(i)) || (int32_t)((uint32_t)now - ready_after) < 0
+				|| tracker_remote_command[i] != ESB_PONG_FLAG_NORMAL) {
+				continue;
+			}
+			if (enabled) {
+				tracker_test_on_tps[i] = test_all_wire_tps();
+			}
+			__asm__ volatile("" ::: "memory"); /* TPS published before the flag the ISR acts on */
+			/* Re-read right before publishing: if an EVENT-path recovery
+			 * re-armed the grace during iteration, skip this cycle and let
+			 * the next reconcile pass handle the tracker. */
+			if ((uint32_t)atomic_get(&test_all_ready_after_ms[i]) != ready_after) {
+				continue;
+			}
+			tracker_remote_command[i] = command;
+			queued_mask |= BIT(i);
+		}
+		requested = test_all_requested_value();
+		effective = test_all_effective_tps;
+	}
+	irq_unlock(key);
+	if (queued_mask == 0) {
+		return;
+	}
+	LOG_INF(
+		"Queued sticky TEST_MODE_%s for trackers 0x%04x (requested=%u effective=%u)",
+		enabled ? "ON" : "OFF",
+		(unsigned int)queued_mask,
+		enabled ? requested : 0,
+		enabled ? effective : 0
+	);
+}
+
 /**
  * Recalculate dynamic TDMA parameters based on active trackers.
  * Called periodically from esb_stats_thread (non-ISR context).
  */
 static void tdma_recalculate(void)
 {
+	uint32_t old_mask = tdma_active_mask;
+
 	uint64_t now = k_uptime_get();
 	uint8_t active_ids[MAX_TRACKERS];
 	uint8_t active_count = 0;
@@ -332,17 +501,19 @@ static void tdma_recalculate(void)
 			tdma_config_packed[i] = tdma_pack_config(0xFF, active_count, slot_ticks, epoch);
 		}
 	}
+	test_all_note_layout(old_mask, new_mask, (int64_t)now);
 
 	uint8_t old_count = tdma_dynamic_active_count;
 	uint8_t old_slot = tdma_dynamic_slot_ticks;
 	tdma_dynamic_active_count = active_count;
 	tdma_dynamic_slot_ticks = slot_ticks;
 	tdma_active_mask = new_mask;
+	test_all_update_effective(active_count, (int64_t)now, true);
 	tdma_last_reconfig_time = now;
 
 	/* Log on any mask change, not just count changes: knowing WHICH tracker
 	 * joined/left is what makes churn diagnosable from field logs. */
-	if (new_mask != tdma_active_mask || active_count != old_count || slot_ticks != old_slot) {
+	if (new_mask != old_mask || active_count != old_count || slot_ticks != old_slot) {
 		uint32_t frame_ticks = (uint32_t)slot_ticks * active_count;
 		uint32_t est_tps = frame_ticks > 0 ? 32768 / frame_ticks : 0;
 		LOG_INF(
@@ -965,6 +1136,7 @@ static void esb_stats_thread(void)
 			/* Recalculate dynamic TDMA config every TPS print cycle (~1s) */
 			tdma_shadow_update((uint32_t)now);
 			tdma_recalculate();
+			test_all_reconcile((int64_t)now);
 		}
 
 		// Print detailed stats only when enabled
@@ -1279,6 +1451,11 @@ static void esb_ack_handler_cb(
 				ack_payload->data[9] = (ch >> 16) & 0xFF;
 				ack_payload->data[10] = (ch >> 8) & 0xFF;
 				ack_payload->data[11] = (ch) & 0xFF;
+			} else if (cmd == ESB_PONG_FLAG_TEST_MODE_ON) {
+				ack_payload->data[8] = (tracker_test_on_tps[tracker_id] >> 8) & 0xFF;
+				ack_payload->data[9] = tracker_test_on_tps[tracker_id] & 0xFF;
+				ack_payload->data[10] = 0;
+				ack_payload->data[11] = 0;
 			} else if (cmd == ESB_PONG_FLAG_NORMAL) {
 				/* Piggyback dynamic TDMA config in bytes 8-11.
 				 * Atomic 32-bit read on ARM Cortex-M — ISR safe. */
@@ -1676,6 +1853,9 @@ void event_handler(struct esb_evt const *event)
 							last_ping_counter[tracker_id] = counter;
 							last_ping_time[tracker_id] = current_time;
 							last_pong_queued_counter[tracker_id] = 0xFF;
+							if (atomic_get(&test_all_state_valid)) {
+								test_all_invalidate_tracker(tracker_id, (int64_t)current_time);
+							}
 							// Continue processing this PING
 						} else {
 							// Calculate difference
@@ -1736,6 +1916,9 @@ void event_handler(struct esb_evt const *event)
 							last_ping_counter[tracker_id] = counter;
 							// Reset PONG queue tracking
 							last_pong_queued_counter[tracker_id] = 0xFF;
+							if (atomic_get(&test_all_state_valid)) {
+								test_all_invalidate_tracker(tracker_id, (int64_t)current_time);
+							}
 							// Continue processing this PING, send PONG
 						} else if (is_duplicate) {
 							// Same counter as last time - likely a retransmit
@@ -1784,7 +1967,11 @@ void event_handler(struct esb_evt const *event)
 					} // End of else branch for ping_counter_initialized
 
 					if (ping_ack_flag != ESB_PONG_FLAG_NORMAL) {
-						if (tracker_remote_command[tracker_id] == ping_ack_flag) {
+						uint16_t ping_ack_tps = ping_ack_flag == ESB_PONG_FLAG_TEST_MODE_ON
+							? ((uint16_t)rx_payload.data[8] << 8) | rx_payload.data[9] : 0;
+						bool payload_matches = ping_ack_flag != ESB_PONG_FLAG_TEST_MODE_ON
+							|| ping_ack_tps == tracker_test_on_tps[tracker_id];
+						if (tracker_remote_command[tracker_id] == ping_ack_flag && payload_matches) {
 							tracker_remote_command[tracker_id] = ESB_PONG_FLAG_NORMAL;
 							/* Confirmations are frequent under load — keep UART off EVENT IRQ. */
 							LOG_DBG(
@@ -1793,6 +1980,17 @@ void event_handler(struct esb_evt const *event)
 								esb_pong_flag_name(ping_ack_flag),
 								ping_ack_flag
 							);
+							if (atomic_get(&test_all_state_valid)) {
+								bool confirms_all = ping_ack_flag == ESB_PONG_FLAG_TEST_MODE_OFF
+									&& !atomic_get(&test_all_enabled);
+								confirms_all = confirms_all
+									|| (ping_ack_flag == ESB_PONG_FLAG_TEST_MODE_ON
+										&& atomic_get(&test_all_enabled)
+										&& ping_ack_tps == test_all_wire_tps());
+								if (confirms_all) {
+									atomic_or(&test_all_confirmed_mask, BIT(tracker_id));
+								}
+							}
 							if (remote_confirm_cb) {
 								remote_confirm_cb(tracker_id, ping_ack_flag);
 							}
@@ -1855,6 +2053,19 @@ void event_handler(struct esb_evt const *event)
 					LOG_DBG("TRK %d: Out-of-order packet seq=%d, dropped", tracker_id, received_sequence);
 					// Drop out-of-order packet to avoid incorrect pose calculation
 					break;
+				}
+
+				if (seq_result == 3 && atomic_get(&test_all_state_valid)) {
+					/* Quick reboot with ambiguous PING counter: drop the
+					 * sticky confirmation and re-arm the grace. The pending
+					 * command itself is left alone — ACK PONGs are PING-
+					 * driven; the PING restart/timeout path parks the flag
+					 * before the next ACK. */
+					atomic_and(&test_all_confirmed_mask, (atomic_val_t)~BIT(tracker_id));
+					atomic_set(
+						&test_all_ready_after_ms[tracker_id],
+						(atomic_val_t)((uint32_t)k_uptime_get() + TEST_ALL_JOIN_CONFIG_GRACE_MS)
+					);
 				}
 
 				// Forward packet for other cases (normal, potential loss, reboot)
@@ -1945,6 +2156,17 @@ void event_handler(struct esb_evt const *event)
 				if (seq_result == 2) {
 					LOG_WRN("TRK %d: Composite packet seq=%d is out-of-order, dropped", tracker_id, received_sequence);
 					break; /* out-of-order */
+				}
+
+				if (seq_result == 3 && atomic_get(&test_all_state_valid)) {
+					/* Same as the normal data path above: drop the sticky
+					 * confirmation and re-arm the grace, leaving any pending
+					 * command publication alone. */
+					atomic_and(&test_all_confirmed_mask, (atomic_val_t)~BIT(tracker_id));
+					atomic_set(
+						&test_all_ready_after_ms[tracker_id],
+						(atomic_val_t)((uint32_t)k_uptime_get() + TEST_ALL_JOIN_CONFIG_GRACE_MS)
+					);
 				}
 
 				/* Parse sub-packets and reconstruct standard 16-byte packets */
@@ -2534,13 +2756,177 @@ uint32_t esb_send_remote_command_sens_auto_all(uint8_t axis, uint16_t revolution
 	return mask;
 }
 
-void esb_send_remote_command_channel(uint8_t tracker_id, uint8_t channel)
+/* Trackers that sent any packet since scan_start_time. */
+static uint32_t esb_scan_active_mask(int64_t scan_start_time)
 {
-	if (tracker_id < MAX_TRACKERS) {
-		tracker_remote_command[tracker_id] = ESB_PONG_FLAG_SET_CHANNEL;
-		tracker_channel_value = channel;
-		LOG_INF("Queued SET_CHANNEL %u for tracker %u", channel, tracker_id);
+	uint32_t mask = 0;
+	k_mutex_lock(&tracker_store_lock, K_FOREVER);
+	for (uint8_t i = 0; i < stored_trackers && i < MAX_TRACKERS; i++) {
+		if (stored_tracker_addr[i] != 0 && tracker_stats[i].last_packet_time >= scan_start_time) {
+			mask |= (1u << i);
+		}
 	}
+	k_mutex_unlock(&tracker_store_lock);
+	return mask;
+}
+
+static void esb_publish_flag_mask(uint8_t command_flag, uint32_t mask)
+{
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		if (mask & BIT(i)) {
+			tracker_remote_command[i] = command_flag;
+		}
+	}
+}
+
+/* Test-only publication, called under the test irq_lock: publish only onto
+ * idle slots (no pending command is stomped) whose recovery/join grace has
+ * elapsed; skipped trackers converge via reconciliation after their grace. */
+static void esb_publish_test_flag_mask(uint8_t command_flag, uint32_t mask, uint32_t now_u32)
+{
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		if (!(mask & BIT(i)) || tracker_remote_command[i] != ESB_PONG_FLAG_NORMAL) {
+			continue;
+		}
+		uint32_t ready_after = (uint32_t)atomic_get(&test_all_ready_after_ms[i]);
+		if ((int32_t)(now_u32 - ready_after) < 0) {
+			continue;
+		}
+		tracker_remote_command[i] = command_flag;
+	}
+}
+
+uint32_t esb_send_remote_command_test_on(uint8_t tracker_id, uint16_t tps)
+{
+	if (tracker_id >= MAX_TRACKERS) {
+		return 0;
+	}
+	/* Same critical section as the all-broadcast final check: generation
+	 * bump, supersede, and TPS/flag publication cannot interleave. */
+	unsigned int key = irq_lock();
+	atomic_inc(&test_all_generation);
+	/* A targeted command replaces any sticky-all policy and cancels any
+	 * in-flight all-target broadcast during its scan. */
+	test_all_invalidate();
+	/* Publish the TPS before the flag: the ACK handler (radio ISR) echoes it
+	 * as soon as it observes the command flag. */
+	tracker_test_on_tps[tracker_id] = tps;
+	__asm__ volatile("" ::: "memory");
+	tracker_remote_command[tracker_id] = ESB_PONG_FLAG_TEST_MODE_ON;
+	irq_unlock(key);
+	LOG_INF("Queued TEST_MODE_ON (target %u TPS) for tracker %u", tps, tracker_id);
+	return BIT(tracker_id);
+}
+
+uint32_t esb_send_remote_command_test_off(uint8_t tracker_id)
+{
+	if (tracker_id >= MAX_TRACKERS) {
+		return 0;
+	}
+	unsigned int key = irq_lock();
+	atomic_inc(&test_all_generation);
+	test_all_invalidate();
+	tracker_test_on_tps[tracker_id] = 0;
+	__asm__ volatile("" ::: "memory");
+	tracker_remote_command[tracker_id] = ESB_PONG_FLAG_TEST_MODE_OFF;
+	irq_unlock(key);
+	LOG_INF("Queued TEST_MODE_OFF for tracker %u", tracker_id);
+	return BIT(tracker_id);
+}
+
+uint32_t esb_send_remote_command_test_on_all(uint16_t tps)
+{
+	k_mutex_lock(&test_all_mutex, K_FOREVER);
+	/* Guard first, then own a generation token: anything that bumps the
+	 * counter after this point supersedes us and also releases the guard. */
+	atomic_set(&test_all_broadcasting, 1);
+	atomic_val_t gen = atomic_inc(&test_all_generation) + 1;
+	int64_t scan_start_time = k_uptime_get();
+	k_msleep(REMOTE_COMMAND_ACTIVE_SCAN_MS);
+	uint32_t mask = esb_scan_active_mask(scan_start_time);
+
+	uint16_t requested = 0;
+	/* Final generation check through sticky state, TPS, and flag publication
+	 * is one critical section shared with targeted commands and reconcile:
+	 * once the check passes under the lock, nothing can supersede us. */
+	unsigned int key = irq_lock();
+	if (atomic_get(&test_all_generation) != gen) {
+		irq_unlock(key);
+		/* The mutex guarantees no other all-helper is inside: safe to
+		 * release the guard here so reconciliation is not wedged. */
+		atomic_set(&test_all_broadcasting, 0);
+		LOG_WRN("Sticky TEST_MODE_ON aborted: superseded during active scan");
+		k_mutex_unlock(&test_all_mutex);
+		return 0;
+	}
+	atomic_set(&test_all_state_valid, 1);
+	atomic_set(&test_all_enabled, 1);
+	atomic_set(&test_all_confirmed_mask, 0);
+	test_all_requested_tps = tps;
+	requested = test_all_requested_value();
+	test_all_effective_tps = MIN(requested, test_all_capacity_tps(tdma_dynamic_active_count));
+	uint16_t wire_tps = test_all_wire_tps();
+	uint32_t now_u32 = (uint32_t)k_uptime_get();
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		tracker_test_on_tps[i] = wire_tps;
+		/* Keep an armed recovery/join grace so reconciliation honors the
+		 * remaining window; only expired timers reset. */
+		uint32_t ready_after = (uint32_t)atomic_get(&test_all_ready_after_ms[i]);
+		if ((int32_t)(now_u32 - ready_after) >= 0) {
+			atomic_set(&test_all_ready_after_ms[i], 0);
+		}
+	}
+	__asm__ volatile("" ::: "memory");
+	esb_publish_test_flag_mask(ESB_PONG_FLAG_TEST_MODE_ON, mask, now_u32);
+	atomic_set(&test_all_broadcasting, 0);
+	irq_unlock(key);
+	LOG_INF(
+		"Sticky TEST_MODE_ON enabled: requested=%u effective=%u active=%u targeted=0x%04x",
+		requested,
+		test_all_effective_tps,
+		tdma_dynamic_active_count,
+		(unsigned int)mask
+	);
+	k_mutex_unlock(&test_all_mutex);
+	return mask;
+}
+
+uint32_t esb_send_remote_command_test_off_all(void)
+{
+	k_mutex_lock(&test_all_mutex, K_FOREVER);
+	atomic_set(&test_all_broadcasting, 1);
+	atomic_val_t gen = atomic_inc(&test_all_generation) + 1;
+	int64_t scan_start_time = k_uptime_get();
+	k_msleep(REMOTE_COMMAND_ACTIVE_SCAN_MS);
+	uint32_t mask = esb_scan_active_mask(scan_start_time);
+
+	unsigned int key = irq_lock();
+	if (atomic_get(&test_all_generation) != gen) {
+		irq_unlock(key);
+		atomic_set(&test_all_broadcasting, 0);
+		LOG_WRN("Sticky TEST_MODE_OFF aborted: superseded during active scan");
+		k_mutex_unlock(&test_all_mutex);
+		return 0;
+	}
+	atomic_set(&test_all_state_valid, 1);
+	atomic_set(&test_all_enabled, 0);
+	atomic_set(&test_all_confirmed_mask, 0);
+	test_all_effective_tps = 0;
+	uint32_t now_u32 = (uint32_t)k_uptime_get();
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		tracker_test_on_tps[i] = 0;
+		uint32_t ready_after = (uint32_t)atomic_get(&test_all_ready_after_ms[i]);
+		if ((int32_t)(now_u32 - ready_after) >= 0) {
+			atomic_set(&test_all_ready_after_ms[i], 0);
+		}
+	}
+	__asm__ volatile("" ::: "memory");
+	esb_publish_test_flag_mask(ESB_PONG_FLAG_TEST_MODE_OFF, mask, now_u32);
+	atomic_set(&test_all_broadcasting, 0);
+	irq_unlock(key);
+	LOG_INF("Sticky TEST_MODE_OFF enabled for current and future active trackers");
+	k_mutex_unlock(&test_all_mutex);
+	return mask;
 }
 
 static const char *esb_pong_flag_name(uint8_t flag)
@@ -2662,19 +3048,17 @@ void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag)
 // Send remote command to all paired trackers
 uint32_t esb_send_remote_command_all(uint8_t command_flag)
 {
-	uint32_t mask = 0;
-	uint8_t count = 0;
 	int64_t scan_start_time = k_uptime_get();
-	char active_tracker_ids[(MAX_TRACKERS * 4) + 1];
-	size_t active_tracker_ids_len = 0;
-
 	k_msleep(REMOTE_COMMAND_ACTIVE_SCAN_MS);
 
-	k_mutex_lock(&tracker_store_lock, K_FOREVER);
-	for (uint8_t i = 0; i < stored_trackers && i < MAX_TRACKERS; i++) {
-		if (stored_tracker_addr[i] != 0 && tracker_stats[i].last_packet_time >= scan_start_time) {
-			tracker_remote_command[i] = command_flag;
-			mask |= (1u << i);
+	uint32_t mask = esb_scan_active_mask(scan_start_time);
+	esb_publish_flag_mask(command_flag, mask);
+
+	char active_tracker_ids[(MAX_TRACKERS * 4) + 1];
+	size_t active_tracker_ids_len = 0;
+	uint8_t count = 0;
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		if (mask & BIT(i)) {
 			if (active_tracker_ids_len < sizeof(active_tracker_ids)) {
 				int written = snprintk(
 					&active_tracker_ids[active_tracker_ids_len],
@@ -2690,7 +3074,6 @@ uint32_t esb_send_remote_command_all(uint8_t command_flag)
 			count++;
 		}
 	}
-	k_mutex_unlock(&tracker_store_lock);
 
 	if (count == 0) {
 		active_tracker_ids[0] = '\0';
