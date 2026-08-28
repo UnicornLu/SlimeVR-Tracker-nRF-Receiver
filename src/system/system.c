@@ -2,7 +2,7 @@
 #include "connection/esb.h"
 #include "system/led.h"
 #include "system/status.h"
-#include "retained.h"
+#include <hal/nrf_power.h>
 
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pwm.h>
@@ -14,6 +14,9 @@
 #include <hal/nrf_power.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
+#if defined(CONFIG_BOOTLOADER_MCUBOOT)
+#include <zephyr/retention/bootmode.h>
+#endif
 
 #include "system.h"
 
@@ -31,17 +34,55 @@ LOG_MODULE_REGISTER(system, LOG_LEVEL_INF);
 static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static int64_t press_time = 0;
 static int64_t last_press_duration = 0;
+bool button_held_from_init;
 static void button_thread(void);
-K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, 6, 0, 0);
+/* below ESB_THREAD_PRIORITY; keep equal with led/status */
+K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, BUTTON_THREAD_PRIORITY, 0, 0);
 #else
 #define BUTTON_EXISTS false
 #pragma message "Button GPIO does not exist"
 #endif
 
 // DFU support check
-#define DFU_EXISTS CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
-#define DFU_DBL_RESET_MEM 0x20007F7C
-#define DFU_DBL_RESET_APP 0x4ee5677e
+#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER || CONFIG_BOOTLOADER_MCUBOOT)
+#define ADAFRUIT_DFU_MAGIC_UF2_RESET 0x57
+#define ADAFRUIT_DFU_MAGIC_OTA_RESET 0xA8
+#define ADAFRUIT_DFU_MAGIC_SKIP 0x6D
+
+void sys_skip_dfu_marker(void)
+{
+#if DFU_EXISTS && !CONFIG_BOOTLOADER_MCUBOOT
+	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP; // Skip DFU
+#endif
+}
+
+void sys_enter_dfu(bool ota)
+{
+#if defined(CONFIG_BOOTLOADER_MCUBOOT)
+	ARG_UNUSED(ota);
+	int err = bootmode_set(BOOT_MODE_TYPE_BOOTLOADER);
+	if (err) {
+		LOG_ERR("Failed to request MCUboot recovery: %d", err);
+		return;
+	}
+	LOG_INF("MCUboot serial recovery requested");
+	sys_request_system_reboot();
+#elif CONFIG_BUILD_OUTPUT_UF2
+	NRF_POWER->GPREGRET = ota ? ADAFRUIT_DFU_MAGIC_OTA_RESET : ADAFRUIT_DFU_MAGIC_UF2_RESET;
+	k_msleep(100);
+	sys_request_system_reboot();
+#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+	ARG_UNUSED(ota);
+	const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+	if (device_is_ready(gpio_dev)) {
+		gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
+		k_msleep(100);
+	}
+	sys_request_system_reboot();
+#else
+	ARG_UNUSED(ota);
+#endif
+}
 
 static bool nvs_init = false;
 
@@ -82,8 +123,10 @@ SYS_INIT(sys_nvs_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 
 // TODO: switch back to retained?
 uint8_t reboot_counter_read(void) {
-	uint8_t reboot_counter;
-	nvs_read(&fs, RBT_CNT_ID, &reboot_counter, sizeof(reboot_counter));
+	uint8_t reboot_counter = 0;
+	if (nvs_read(&fs, RBT_CNT_ID, &reboot_counter, sizeof(reboot_counter)) < 0) {
+		return 0;
+	}
 	return reboot_counter;
 }
 
@@ -92,6 +135,9 @@ static void button_pressed(const struct device *dev, struct gpio_callback *cb, u
 {
 	bool pressed = button_read();
 	int64_t current_time = k_uptime_get();
+	if (!pressed && button_held_from_init) { // after first depress, now allow events that need unambiguous button hold
+		button_held_from_init = false;
+	}
 	if (press_time && !pressed && current_time - press_time > 50) // debounce
 		last_press_duration = current_time - press_time;
 	else if (press_time && pressed) // unusual press event on button already pressed
@@ -103,15 +149,32 @@ static struct gpio_callback button_cb_data;
 
 static int sys_button_init(void)
 {
+#ifdef NRF_RESET
+	bool reset_vbus_reset = NRF_RESET->RESETREAS & RESET_RESETREAS_VBUS_Msk;
+#else
+	bool reset_vbus_reset = NRF_POWER->RESETREAS & POWER_RESETREAS_VBUS_Msk;
+#endif
 	gpio_pin_configure_dt(&button0, GPIO_INPUT);
 	gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_BOTH);
 	gpio_init_callback(&button_cb_data, button_pressed, BIT(button0.pin));
 	gpio_add_callback(button0.port, &button_cb_data);
+	if (!reset_vbus_reset) { // button held at init is only a deliberate hold if reset was not caused by VBUS (USB plug-in wake)
+		button_held_from_init = gpio_pin_get_dt(&button0);
+	}
 	return 0;
 }
 
 SYS_INIT(sys_button_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 #endif
+
+bool button_read_filtered(void) // ignores initial press only if button was held since boot (e.g. wake key)
+{
+#if BUTTON_EXISTS
+	return button_held_from_init ? false : gpio_pin_get_dt(&button0);
+#else
+	return false;
+#endif
+}
 
 bool button_read(void)
 {
@@ -189,26 +252,7 @@ static void button_thread(void)
 			{
 				LOG_INF("DFU mode requested (10s)");
 				set_led(SYS_LED_PATTERN_ERROR_D, SYS_LED_PRIORITY_HIGHEST);
-#if DFU_EXISTS
-#if CONFIG_BUILD_OUTPUT_UF2 // Adafruit bootloader
-				NRF_POWER->GPREGRET = 0x57;
-#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER // NRF5 bootloader
-				// Use GPIO method to enter DFU
-				const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
-				if (device_is_ready(gpio_dev))
-				{
-					gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
-				}
-#else
-				// Use double reset memory method as fallback
-				*dbl_reset_mem = DFU_DBL_RESET_APP;
-				ram_range_retain(dbl_reset_mem, sizeof(*dbl_reset_mem), true);
-#endif
-				// Wait a bit to ensure data is written
-				k_msleep(100);
-#endif
-				// System reboot to enter DFU
-				sys_request_system_reboot();
+				sys_enter_dfu(false);
 				long_press_10s_handled = true;
 				return; // Exit thread as system will reboot
 			}
