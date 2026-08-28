@@ -28,7 +28,6 @@
 #define USB DT_NODELABEL(usbd)
 #if DT_NODE_HAS_STATUS(USB, okay)
 
-#include <zephyr/drivers/uart.h>
 #include <zephyr/console/console.h>
 #include <zephyr/logging/log_ctrl.h>
 #include "connection/esb.h"
@@ -45,8 +44,10 @@
 LOG_MODULE_REGISTER(console, LOG_LEVEL_INF);
 
 static void console_thread(void);
-/* below ESB_THREAD_PRIORITY; console must not preempt radio housekeeping */
-K_THREAD_DEFINE(console_thread_id, 1024, console_thread, NULL, NULL, NULL, CONSOLE_THREAD_PRIORITY, 0, 0);
+static struct k_thread console_thread_id;
+static K_THREAD_STACK_DEFINE(console_thread_stack, 1024);
+static bool console_thread_running;
+static bool console_thread_initialized;
 
 #define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER || CONFIG_BOOTLOADER_MCUBOOT)
 
@@ -208,42 +209,37 @@ static bool parse_u8_arg(const char *str, uint8_t *value)
 	return true;
 }
 
+void console_serial_start(void)
+{
+	if (!console_thread_initialized) {
+		console_thread_initialized = true;
+		console_getline_init();
+#if defined(CONFIG_DATA_COLLECT) && !defined(CONFIG_DATA_COLLECT_HID)
+		data_collect_init();
+#endif
+	}
+	if (console_thread_running) {
+		return;
+	}
+	console_thread_running = true;
+	k_thread_create(&console_thread_id, console_thread_stack,
+			K_THREAD_STACK_SIZEOF(console_thread_stack),
+			(k_thread_entry_t)console_thread, NULL, NULL, NULL,
+			CONSOLE_THREAD_PRIORITY, 0, K_NO_WAIT);
+}
+
+void console_serial_stop(void)
+{
+	if (!console_thread_running) {
+		return;
+	}
+	k_thread_abort(&console_thread_id);
+	console_thread_running = false;
+}
+
 static void console_thread(void)
 {
-#if DFU_EXISTS
-	if (button_read()) { // button held on usb connect, enter DFU
-		sys_enter_dfu(false);
-	}
-#endif
-
-	/* Data collection: HID mode uses SYS_INIT, CDC mode needs manual init */
-#if defined(CONFIG_DATA_COLLECT) && !defined(CONFIG_DATA_COLLECT_HID)
-	data_collect_init();
-#endif
-
-	console_getline_init();
-
-	// Wait for any pending log data to be processed
-	while (log_data_pending()) {
-		k_usleep(1);
-	}
-
-	// Wait for USB CDC to be ready by checking DTR (Data Terminal Ready) signal
-	// This ensures the terminal is actually connected and ready to receive data
-	const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-	if (device_is_ready(uart_dev)) {
-		uint32_t dtr = 0;
-		// Wait up to 5 seconds for DTR to be asserted (terminal connected)
-		for (int i = 0; i < 50; i++) {
-			if (uart_line_ctrl_get(uart_dev, UART_LINE_CTRL_DTR, &dtr) == 0 && dtr) {
-				break;
-			}
-			k_msleep(100);
-		}
-		// Give a bit more time for the terminal to be fully ready
-		k_msleep(100);
-	}
-
+	// Created only while the host asserts DTR; USB lifecycle lives in usb.c.
 	printk("*** " CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT " ***\n");
 	printk(FW_STRING);
 	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
