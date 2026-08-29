@@ -23,11 +23,15 @@
 #include "globals.h"
 #include "hid.h"
 #include "connection/esb.h"
+#include "esb_ota.h"
+#include "receiver_ota.h"
+#include "rcv_cmd.h"
+#include "rcv_hid_cmd.h"
+#include "usb.h"
 
 #include <limits.h>
 #include <zephyr/kernel.h>
-#include <zephyr/usb/usb_device.h>
-#include <zephyr/usb/class/usb_hid.h>
+#include <zephyr/usb/class/usbd_hid.h>
 
 static struct k_work report_send;
 
@@ -35,27 +39,120 @@ static struct tracker_report {
 	uint8_t data[16];
 } __packed report = {
 	.data = {0}
-};;
-
+};
 
 #define MAX_REPORTS (MAX_TRACKERS * 4)
+BUILD_ASSERT((MAX_REPORTS & (MAX_REPORTS - 1)) == 0, "MAX_REPORTS must be power of two");
+/* Keep a few slots free for CMD_ACK / OTA status under stream load. */
+#define HID_FIFO_PRIORITY_RESERVE 2
+#define HID_FIFO_MASK (MAX_REPORTS - 1)
 
-struct tracker_report reports[MAX_REPORTS];
-atomic_t report_write_index = 0;
-atomic_t report_read_index = 0;
-// read_index == write_index -> empty fifo
-// (write_index + 1) % MAX_REPORTS == read_index -> full fifo
+/*
+ * Lock-free bounded MPSC ring (ticket + per-slot seq).
+ * Producers: ESB EVENT IRQ, USB/cmd threads. Consumer: send_report work.
+ * Claim write_pos with CAS, publish via seq = pos+1; consumer waits seq == read+1.
+ */
+struct hid_fifo_slot {
+	uint8_t data[16];
+	atomic_t seq;
+};
 
-static bool configured;
+static struct hid_fifo_slot hid_fifo_slots[MAX_REPORTS];
+static atomic_t hid_fifo_write_pos = ATOMIC_INIT(0);
+static atomic_t hid_fifo_read_pos = ATOMIC_INIT(0);
+
+static void hid_fifo_init(void)
+{
+	for (uint32_t i = 0; i < MAX_REPORTS; i++) {
+		atomic_set(&hid_fifo_slots[i].seq, (atomic_val_t)i);
+	}
+	atomic_set(&hid_fifo_write_pos, 0);
+	atomic_set(&hid_fifo_read_pos, 0);
+}
+
+static bool hid_fifo_is_priority(uint8_t type)
+{
+	return type == RCV_HID_TYPE_CMD_ACK || (type >= 0xF0 && type <= 0xF7);
+}
+
+static bool hid_fifo_try_push(const uint8_t data[16], bool priority)
+{
+	uint32_t pos;
+
+	for (;;) {
+		pos = (uint32_t)atomic_get(&hid_fifo_write_pos);
+		uint32_t read = (uint32_t)atomic_get(&hid_fifo_read_pos);
+		uint32_t count = pos - read;
+
+		if (count >= MAX_REPORTS) {
+			return false;
+		}
+		uint32_t free_slots = MAX_REPORTS - count;
+		if (!priority && free_slots <= HID_FIFO_PRIORITY_RESERVE) {
+			return false;
+		}
+		if (atomic_cas(&hid_fifo_write_pos, (atomic_val_t)pos, (atomic_val_t)(pos + 1))) {
+			break;
+		}
+	}
+
+	struct hid_fifo_slot *slot = &hid_fifo_slots[pos & HID_FIFO_MASK];
+	/*
+	 * Single-core: consume publishes seq before read_pos, so capacity check
+	 * means slot is ready. Never spin here — producers include ESB EVENT IRQ.
+	 */
+	memcpy(slot->data, data, sizeof(slot->data));
+	atomic_set(&slot->seq, (atomic_val_t)(pos + 1));
+	return true;
+}
+
+/* Peek without consuming — consume only after USB submit succeeds. */
+static size_t hid_fifo_peek_batch(struct tracker_report *out, size_t max)
+{
+	size_t n = 0;
+	uint32_t read = (uint32_t)atomic_get(&hid_fifo_read_pos);
+
+	while (n < max) {
+		struct hid_fifo_slot *slot = &hid_fifo_slots[(read + (uint32_t)n) & HID_FIFO_MASK];
+
+		if ((uint32_t)atomic_get(&slot->seq) != read + (uint32_t)n + 1U) {
+			break;
+		}
+		memcpy(out[n].data, slot->data, sizeof(out[n].data));
+		n++;
+	}
+	return n;
+}
+
+static void hid_fifo_consume(size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		uint32_t read = (uint32_t)atomic_get(&hid_fifo_read_pos);
+		struct hid_fifo_slot *slot = &hid_fifo_slots[read & HID_FIFO_MASK];
+
+		atomic_set(&slot->seq, (atomic_val_t)(read + MAX_REPORTS));
+		atomic_set(&hid_fifo_read_pos, (atomic_val_t)(read + 1U));
+	}
+}
+
+static bool hid_fifo_is_empty(void)
+{
+	uint32_t read = (uint32_t)atomic_get(&hid_fifo_read_pos);
+	struct hid_fifo_slot *slot = &hid_fifo_slots[read & HID_FIFO_MASK];
+
+	return (uint32_t)atomic_get(&slot->seq) != read + 1U;
+}
+
 static const struct device *hdev;
 static ATOMIC_DEFINE(hid_ep_in_busy, 1);
+static bool hid_ready;
+static uint32_t hid_idle_duration_ms;
 
 #define HID_EP_BUSY_FLAG	0
 #define REPORT_PERIOD		K_MSEC(1) // streaming reports
 #define HID_EP_REPORT_COUNT 4
 #define HID_TPS_UPDATE_INTERVAL_MS 1000
 #define HID_STATS_POLL_INTERVAL_MS 200
-#define USB_EP_TIMEOUT_MS 100  // USB endpoint timeout threshold
 
 // EMA平滑因子配置
 // alpha = RSSI_EMA_ALPHA / 256
@@ -63,7 +160,7 @@ static ATOMIC_DEFINE(hid_ep_in_busy, 1);
 // alpha越小，平滑效果越强但响应越慢
 #define RSSI_EMA_ALPHA 51  // 范围: 1-255, 推荐值: 26-77 (0.1-0.3)
 
-struct tracker_report ep_report_buffer[HID_EP_REPORT_COUNT];
+struct tracker_report ep_report_buffer[HID_EP_REPORT_COUNT] __aligned(sizeof(void *));
 
 // RSSI EMA平滑处理结构
 struct rssi_ema_state {
@@ -102,16 +199,32 @@ static const uint8_t hid_report_desc[] = {
 		HID_REPORT_SIZE(8),
 		HID_REPORT_COUNT(64),
 		HID_INPUT(0x02),
+		HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
+		HID_REPORT_SIZE(8),
+		HID_REPORT_COUNT(64),
+		HID_OUTPUT(0x02),
 	HID_END_COLLECTION,
 };
 
 uint16_t sent_device_addr = 0;
-bool usb_enabled = false;
 int64_t last_registration_sent = 0;
+
+//|type    |description
+//|TX   255|registration: associate tracker id with device address
+//|RX   254|dongle command envelope (see rcv_hid_cmd.h)
+//|TX   251|dongle command ACK
+//|RX/TX 240-247|HID OTA (see esb_ota.h / receiver_ota.h)
+// Tracker stream types 0-7 are documented near hid_write_packet_n.
+
+//|b0      |b1      |b2      |b3      |b4      |b5      |b6      |b7      |b8      |b9      |b10     |b11     |b12     |b13     |b14     |b15     |
+//|type    |data                                                                                                                                  |
+//|TX   255|id      |device_addr                                          |resv-------------------------------------------------------------------|
+//|TX   251|seq     |opcode  |status  |result---------------------------------------------------------------|
+//|RX   254|seq     |opcode  |flags   |args-----------------------------------------------------------------|
 
 static void packet_device_addr(uint8_t *report, uint16_t id) // associate id and tracker address
 {
-	report[0] = 255; // receiver packet 0
+	report[0] = RCV_HID_TYPE_DEVICE_ADDR;
 	report[1] = id;
 	memcpy(&report[2], &stored_tracker_addr[id], 6);
 	memset(&report[8], 0, 8); // last 8 bytes unused for now
@@ -176,62 +289,39 @@ static uint32_t hid_stats_snapshot(bool *had_activity)
 
 static uint32_t dropped_reports = 0;
 static uint16_t max_dropped_reports = 0;
-static int64_t last_ep_busy_time = 0;  // Track USB endpoint busy time for timeout detection
+/* Per-tracker drop counters; printed from logging thread when detailed stats on. */
+static uint32_t tracker_drops[MAX_TRACKERS] = {0};
+static uint32_t total_dropped_reports = 0;
+static uint32_t total_tracker_drops[MAX_TRACKERS] = {0};
+
+uint32_t hid_get_total_drop_count(void)
+{
+	return total_dropped_reports;
+}
+
+uint32_t hid_get_total_tracker_drop_count(uint8_t tracker_id)
+{
+	return tracker_id < MAX_TRACKERS ? total_tracker_drops[tracker_id] : 0;
+}
+
 
 static void send_report(struct k_work *work)
 {
-	if (!usb_enabled) return;
-	if (!configured) return;  // Don't send reports until USB is configured
+	if (!receiver_usb_is_enabled()) return;
+	if (!receiver_usb_is_configured()) return;
+	if (!hid_ready) return;
 	if (!stored_trackers) return;
 
-	// Check if USB endpoint is stuck
-	if (atomic_test_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
-		int64_t now = k_uptime_get();
-		if (last_ep_busy_time == 0) {
-			last_ep_busy_time = now;
-		} else if (now - last_ep_busy_time > USB_EP_TIMEOUT_MS) {
-			LOG_WRN("USB endpoint stuck for %lld ms, forcing reset", now - last_ep_busy_time);
-			atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
-			last_ep_busy_time = 0;
-		}
-	} else {
-		last_ep_busy_time = 0;
-	}
-
-	// Get current FIFO status atomically
-	size_t write_idx = (size_t)atomic_get(&report_write_index);
-	size_t read_idx = (size_t)atomic_get(&report_read_index);
-
-	if (write_idx == read_idx && k_uptime_get() - 100 < last_registration_sent) {
+	if (hid_fifo_is_empty() && k_uptime_get() - 100 < last_registration_sent) {
 		return; // send registrations only every 100ms
 	}
 
-	int ret, wrote;
-
-	last_registration_sent = k_uptime_get();
+	int ret;
 
 	if (!atomic_test_and_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
-		// Calculate how many reports we have available
-		int available_reports = write_idx - read_idx;
-		if (available_reports < 0) available_reports += MAX_REPORTS;
-		size_t reports_to_send = (size_t) MIN(available_reports, HID_EP_REPORT_COUNT);
+		size_t reports_to_send = hid_fifo_peek_batch(ep_report_buffer, HID_EP_REPORT_COUNT);
 
-		int epind;
-		// Copy existing data to buffer
-		for (epind = 0; epind < reports_to_send; epind++) {
-			ep_report_buffer[epind] = reports[read_idx];
-			read_idx++;
-			if (read_idx == MAX_REPORTS) {
-				read_idx = 0;
-			}
-		}
-
-		if (reports_to_send > 0U) {
-			atomic_set(&report_read_index, read_idx);
-			hid_stats_record_reports((uint32_t)reports_to_send);
-		}
-
-		// Pad remaining report slots with device addr
+		int epind = (int)reports_to_send;
 		for (; epind < HID_EP_REPORT_COUNT; epind++) {
 			if (stored_trackers > 0) {
 				packet_device_addr(ep_report_buffer[epind].data, sent_device_addr);
@@ -239,19 +329,24 @@ static void send_report(struct k_work *work)
 			}
 		}
 
-		ret = hid_int_ep_write(hdev, (uint8_t *)ep_report_buffer, sizeof(report) * HID_EP_REPORT_COUNT, &wrote);
+		ret = hid_device_submit_report(hdev, sizeof(report) * HID_EP_REPORT_COUNT,
+					       (uint8_t *)ep_report_buffer);
 
 		if (ret != 0) {
-			/*
-			 * Do nothing and wait until host has reset the device
-			 * and hid_ep_in_busy is cleared.
-			 */
-			LOG_ERR("Failed to submit report");
+			atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
+			static int64_t last_err_log;
+			int64_t now = k_uptime_get();
+			if (ret != -EACCES && now - last_err_log > 5000) {
+				LOG_ERR("Failed to submit report: %d", ret);
+				last_err_log = now;
+			}
 		} else {
-			//LOG_DBG("Report submitted");
+			hid_fifo_consume(reports_to_send);
+			last_registration_sent = k_uptime_get();
+			if (reports_to_send > 0U) {
+				hid_stats_record_reports((uint32_t)reports_to_send);
+			}
 		}
-	} else { // busy with what
-		//LOG_DBG("HID IN endpoint busy");
 	}
 }
 
@@ -282,6 +377,13 @@ static void hid_dropped_reports_logging(void)
 				LOG_INF("Dropped reports: %u (max: %u)", dropped_reports, max_dropped_reports);
 			dropped_reports = 0;
 			max_dropped_reports = 0;
+
+			for (int i = 0; i < MAX_TRACKERS; i++) {
+				if (tracker_drops[i]) {
+					LOG_INF("HID drops trk %u: %u", i, tracker_drops[i]);
+					tracker_drops[i] = 0;
+				}
+			}
 
 			if (had_activity && current_tps != last_logged_tps) {
 				LOG_INF("HID TPS: %u", current_tps);
@@ -346,162 +448,324 @@ void hid_reset_all_rssi_smooth(void)
 	memset(rssi_states, 0, sizeof(rssi_states));
 }
 
-K_THREAD_DEFINE(hid_dropped_reports_logging_thread, 256, hid_dropped_reports_logging, NULL, NULL, NULL, 7, 0, 0);
+/* Below ESB_THREAD_PRIORITY; must not compete with radio housekeeping. */
+K_THREAD_DEFINE(hid_dropped_reports_logging_thread, 256, hid_dropped_reports_logging, NULL, NULL, NULL, HID_DROPPED_REPORTS_LOGGING_PRIORITY, 0, 0);
 
-static void int_in_ready_cb(const struct device *dev)
+static void handle_output_report(const uint8_t *buf, uint16_t len)
 {
-	ARG_UNUSED(dev);
-	if (!atomic_test_and_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
-		LOG_WRN("IN endpoint callback without preceding buffer write");
+	if (len == 0) {
+		return;
+	}
+
+	uint8_t report_type = buf[0];
+	if (report_type >= 0xF0 && report_type <= 0xF7) {
+		if (len >= 2 && buf[1] == RECEIVER_OTA_ID) {
+			receiver_ota_process_hid(buf, len);
+		} else {
+			esb_ota_relay_process_hid(buf, len);
+		}
+		return;
+	}
+
+	if (report_type == RCV_HID_TYPE_CMD) {
+		uint8_t ack[RCV_HID_CMD_LEN];
+		if (rcv_cmd_process_hid(buf, len, ack)) {
+			hid_write_packet_n(ack, 0);
+		}
 	}
 }
 
-/*
- * On Idle callback is available here as an example even if actual use is
- * very limited. In contrast to report_event_handler(),
- * report value is not incremented here.
- */
-static void on_idle_cb(const struct device *dev, uint16_t report_id)
+/* CMD path can printk / take mutex / clear trackers — keep off USB callback. */
+struct hid_cmd_msg {
+	uint8_t len;
+	uint8_t data[RCV_HID_CMD_LEN];
+};
+
+K_MSGQ_DEFINE(hid_cmd_msgq, sizeof(struct hid_cmd_msg), 4, 4);
+
+static void hid_cmd_work_handler(struct k_work *work)
 {
-	LOG_DBG("On idle callback");
+	ARG_UNUSED(work);
+	struct hid_cmd_msg msg;
+
+	while (k_msgq_get(&hid_cmd_msgq, &msg, K_NO_WAIT) == 0) {
+		handle_output_report(msg.data, msg.len);
+	}
+}
+
+static K_WORK_DEFINE(hid_cmd_work, hid_cmd_work_handler);
+
+static void enqueue_hid_cmd(const uint8_t *buf, uint16_t len)
+{
+	struct hid_cmd_msg msg;
+
+	if (len < 1) {
+		return;
+	}
+	msg.len = (uint8_t)MIN(len, sizeof(msg.data));
+	memcpy(msg.data, buf, msg.len);
+	if (k_msgq_put(&hid_cmd_msgq, &msg, K_NO_WAIT) != 0) {
+		LOG_WRN("HID CMD queue full, dropping");
+		return;
+	}
+	k_work_submit(&hid_cmd_work);
+}
+
+static void dispatch_output_report(const uint8_t *buf, uint16_t len)
+{
+	if (len == 0 || buf == NULL) {
+		return;
+	}
+
+	/* OTA DATA needs throughput: stay synchronous. CMD: defer. */
+	if (buf[0] == RCV_HID_TYPE_CMD) {
+		enqueue_hid_cmd(buf, len);
+		return;
+	}
+	handle_output_report(buf, len);
+}
+
+static void int_in_ready_cb(const struct device *dev)
+{
+	if (dev != hdev) {
+		return;
+	}
+
+	if (!atomic_test_and_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
+		if (receiver_usb_is_configured() && hid_ready) {
+			LOG_WRN("IN endpoint callback without preceding buffer write");
+		}
+	}
+}
+
+static void input_report_done_cb(const struct device *dev, const uint8_t *const submitted_report)
+{
+	if (dev != hdev) {
+		return;
+	}
+
+	if (submitted_report != (const uint8_t *)ep_report_buffer &&
+	    receiver_usb_is_configured() && hid_ready) {
+		LOG_WRN("IN endpoint callback for unexpected report buffer");
+	}
+
+	int_in_ready_cb(dev);
+}
+
+static void iface_ready_cb(const struct device *dev, const bool ready)
+{
+	if (dev != hdev) {
+		return;
+	}
+
+	hid_ready = ready;
+	if (!ready) {
+		atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
+	}
+}
+
+static int get_report_cb(const struct device *dev, const uint8_t type, const uint8_t id,
+			 const uint16_t len, uint8_t *const buf)
+{
+	if (dev != hdev) {
+		return -ENODEV;
+	}
+
+	if (type != HID_REPORT_TYPE_INPUT || id != 0U) {
+		return -ENOTSUP;
+	}
+
+	if (len < sizeof(ep_report_buffer) || buf == NULL) {
+		return -EINVAL;
+	}
+
+	memset(buf, 0, sizeof(ep_report_buffer));
+	return sizeof(ep_report_buffer);
+}
+
+static int set_report_cb(const struct device *dev, const uint8_t type, const uint8_t id,
+			 const uint16_t len, const uint8_t *const buf)
+{
+	if (dev != hdev) {
+		return -ENODEV;
+	}
+
+	if (type != HID_REPORT_TYPE_OUTPUT || id != 0U) {
+		return -ENOTSUP;
+	}
+
+	if (len == 0U || len > 64U || buf == NULL) {
+		return -EINVAL;
+	}
+
+	dispatch_output_report(buf, len);
+	return 0;
+}
+
+static void on_idle_cb(const struct device *dev, const uint8_t report_id, const uint32_t duration)
+{
+	if (dev != hdev || report_id != 0U) {
+		return;
+	}
+
+	hid_idle_duration_ms = duration;
 	k_work_submit(&report_send);
+}
+
+static uint32_t get_idle_cb(const struct device *dev, const uint8_t report_id)
+{
+	if (dev != hdev || report_id != 0U) {
+		return 0;
+	}
+
+	return hid_idle_duration_ms;
+}
+
+static void output_report_cb(const struct device *dev, const uint16_t len, const uint8_t *const buf)
+{
+	if (dev != hdev || len == 0U || len > 64U || buf == NULL) {
+		return;
+	}
+
+	dispatch_output_report(buf, len);
 }
 
 static void report_event_handler(struct k_timer *dummy)
 {
-	if (usb_enabled)
+	ARG_UNUSED(dummy);
+	if (receiver_usb_is_enabled()) {
 		k_work_submit(&report_send);
-}
-
-static void protocol_cb(const struct device *dev, uint8_t protocol)
-{
-	LOG_INF("New protocol: %s", protocol == HID_PROTOCOL_BOOT ?
-		"boot" : "report");
-}
-
-static const struct hid_ops ops = {
-	.int_in_ready = int_in_ready_cb,
-	.on_idle = on_idle_cb,
-	.protocol_change = protocol_cb,
-};
-
-static void status_cb(enum usb_dc_status_code status, const uint8_t *param)
-{
-	switch (status) {
-	case USB_DC_RESET:
-		configured = false;
-		break;
-	case USB_DC_CONFIGURED:
-		int configurationIndex = *param;
-		if(configurationIndex == 0) {
-			// from usb_device.c: A configuration index of 0 unconfigures the device.
-			configured = false;
-		} else {
-			if (!configured) {
-				int_in_ready_cb(hdev);
-				configured = true;
-			}
-		}
-		break;
-	case USB_DC_SOF:
-		break;
-	default:
-		LOG_DBG("status %u unhandled", status);
-		break;
 	}
 }
 
-static int composite_pre_init()
+static const struct hid_device_ops ops = {
+	.iface_ready = iface_ready_cb,
+	.get_report = get_report_cb,
+	.set_report = set_report_cb,
+	.set_idle = on_idle_cb,
+	.get_idle = get_idle_cb,
+	.input_report_done = input_report_done_cb,
+	.output_report = output_report_cb,
+};
+
+static void hid_usb_state_changed(bool configured)
 {
-	hdev = device_get_binding("HID_0");
-	if (hdev == NULL) {
+	if (!configured) {
+		hid_ready = false;
+		atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
+	}
+}
+
+static void hid_async_cmd_ack(const uint8_t ack[RCV_HID_CMD_LEN])
+{
+	hid_write_packet_n(ack, 0);
+}
+
+static int composite_pre_init(void)
+{
+	hdev = DEVICE_DT_GET(DT_NODELABEL(hid_dev_0));
+	if (!device_is_ready(hdev)) {
 		LOG_ERR("Cannot get USB HID Device");
 		return -ENODEV;
 	}
 
 	LOG_INF("HID Device: dev %p", hdev);
 
-	usb_hid_register_device(hdev, hid_report_desc, sizeof(hid_report_desc),
-				&ops);
-
-	atomic_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
-	k_timer_start(&event_timer, REPORT_PERIOD, REPORT_PERIOD);
-
-	if (usb_hid_set_proto_code(hdev, HID_BOOT_IFACE_CODE_NONE)) {
-		LOG_WRN("Failed to set Protocol Code");
+	int ret = hid_device_register(hdev, hid_report_desc, sizeof(hid_report_desc), &ops);
+	if (ret != 0) {
+		LOG_ERR("Failed to register HID device: %d", ret);
+		return ret;
 	}
 
-	return usb_hid_init(hdev);
+	hid_fifo_init();
+	k_work_init(&report_send, send_report);
+	k_timer_start(&event_timer, REPORT_PERIOD, REPORT_PERIOD);
+	receiver_usb_set_state_callback(hid_usb_state_changed);
+	rcv_cmd_set_async_ack(hid_async_cmd_ack);
+
+	return 0;
 }
 
 SYS_INIT(composite_pre_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEVICE);
 
-void usb_init_thread(void)
-{
-	usb_enable(status_cb);
-	k_work_init(&report_send, send_report);
-	usb_enabled = true;
-}
-
-K_THREAD_DEFINE(usb_init_thread_id, 256, usb_init_thread, NULL, NULL, NULL, 6, 0, 0);
+//|type    |description
+//|RX     0|device info ("info")
+//|RX     1|full precision quat and accel
+//|RX     2|reduced precision quat and accel with battery, temp, and rssi ("info")
+//|RX     3|status ("status")
+//|RX     4|full precision quat and magnetometer
+//|RX     5|runtime ("status2")
+//|RX     6|reduced precision quat and accel with button and sleep time ("info2")
+//|RX     7|button and sleep time ("info2")
 
 //|b0      |b1      |b2      |b3      |b4      |b5      |b6      |b7      |b8      |b9      |b10     |b11     |b12     |b13     |b14     |b15     |
 //|type    |id      |packet data                                                                                                                  |
-//|0       |id      |proto   |batt    |batt_v  |temp    |brd_id  |mcu_id  |imu_id  |mag_id  |fw_date          |major   |minor   |patch   |rssi    |
-//|1       |id      |q0               |q1               |q2               |q3               |a0               |a1               |a2               |
-//|2       |id      |batt    |batt_v  |temp    |q_buf                              |a0               |a1               |a2               |rssi    |
-//|3	   |id      |svr_stat|status  |resv                                                                                              |rssi    |
-//|4       |id      |q0               |q1               |q2               |q3               |m0               |m1               |m2               |
-//|255     |id      |addr                                                 |resv                                                                   |
+//|RX     0|id      |batt    |batt_v  |temp    |brd_id  |mcu_id  |resv----|imu_id  |mag_id  |fw_date          |major   |minor   |patch   |rssi    |
+//|RX     1|id      |q0               |q1               |q2               |q3               |a0               |a1               |a2               |
+//|RX     2|id      |batt    |batt_v  |temp    |q_buf                              |a0               |a1               |a2               |rssi    |
+//|RX     3|id      |svr_stat|status  |resv----------------------------------------------------------------------------------------------|rssi    |
+//|RX     4|id      |q0               |q1               |q2               |q3               |m0               |m1               |m2               |
+//|RX     5|id      |runtime                                                                |resv----------------------------------------|rssi    |
+//|RX     6|id      |button  |sleeptime        |resv-------------------------------------------------------------------------------------|rssi    |
+//|RX     7|id      |button  |sleeptime        |q_buf                              |a0               |a1               |a2               |rssi    |
 
-// Per-tracker FIFO drop tracking for detailed diagnostics
-static uint32_t tracker_drops[MAX_TRACKERS] = {0};
-static int64_t last_drop_log_time[MAX_TRACKERS] = {0};
-#define TRACKER_DROP_LOG_INTERVAL_MS 1000  // Log per-tracker drops every 1s
+// runtime is in microseconds (overkill), sleeptime is in milliseconds (overkill but less)
 
-void hid_write_packet_n(uint8_t *data, uint8_t rssi)
+/* byte[1] is a tracker id for stream/registration types, not for cmd/ACK. */
+static bool hid_type_byte1_is_tracker_id(uint8_t type)
 {
-	memcpy(&report.data, data, sizeof(report)); // all data can be passed through
+	return type != RCV_HID_TYPE_CMD_ACK && type != RCV_HID_TYPE_CMD;
+}
 
-	if (data[0] != 1 && data[0] != 4) { // packet 1 and 4 are full precision quat and accel/mag, no room for rssi
-		uint8_t tracker_id = data[1];
-		uint8_t smoothed_rssi = rssi_smooth_update(tracker_id, (int8_t)rssi);
-		report.data[15] = smoothed_rssi;
+/* Types that reserve byte[15] for RSSI (not full-quat or OTA payloads). */
+static bool hid_type_has_rssi_slot(uint8_t type)
+{
+	if (type == 1 || type == 4) {
+		return false;
+	}
+	if (type >= 0xF0 && type <= 0xF7) {
+		return false;
+	}
+	return hid_type_byte1_is_tracker_id(type);
+}
+
+void hid_write_packet_n(const uint8_t *data, uint8_t rssi)
+{
+	uint8_t pkt[16];
+
+	// Drop packets with all-zero quaternion (type 1 and 4: quat in bytes 2-9).
+	if (data[0] == 1 || data[0] == 4) {
+		const uint16_t *q = (const uint16_t *)&data[2];
+		if (q[0] == 0 && q[1] == 0 && q[2] == 0 && q[3] == 0) {
+			return;
+		}
 	}
 
-	// Get current FIFO status atomically
-	size_t write_idx = (size_t)atomic_get(&report_write_index);
-	size_t read_idx = (size_t)atomic_get(&report_read_index);
-
-	// Calculate next write position
-	size_t next_write = write_idx + 1;
-	if (next_write == MAX_REPORTS) next_write = 0;
-
-	// Check if FIFO is full
-	if (next_write == read_idx) {
-		dropped_reports++;
-		if (dropped_reports > max_dropped_reports) {
-			max_dropped_reports = dropped_reports;
-		}
-
-		// Per-tracker drop tracking and logging
+	memcpy(pkt, data, sizeof(pkt));
+	if (hid_type_has_rssi_slot(data[0])) {
 		uint8_t tracker_id = data[1];
 		if (tracker_id < MAX_TRACKERS) {
-			tracker_drops[tracker_id]++;
-			int64_t now = k_uptime_get();
-			if (now - last_drop_log_time[tracker_id] >= TRACKER_DROP_LOG_INTERVAL_MS) {
-				LOG_WRN("FIFO full: dropped %u packets for tracker %u (write=%zu read=%zu)",
-						tracker_drops[tracker_id], tracker_id, write_idx, read_idx);
-				last_drop_log_time[tracker_id] = now;
-				tracker_drops[tracker_id] = 0;
-			}
+			pkt[15] = rssi_smooth_update(tracker_id, (int8_t)rssi);
+		} else {
+			pkt[15] = rssi;
 		}
+	}
+
+	if (hid_fifo_try_push(pkt, hid_fifo_is_priority(data[0]))) {
 		return;
 	}
 
-	// Write new packet into FIFO
-	reports[write_idx] = report;
-
-	// Update write index atomically
-	atomic_set(&report_write_index, next_write);
+	/* Count only — LOG from hid_dropped_reports_logging thread, never EVENT IRQ. */
+	total_dropped_reports++;
+	dropped_reports++;
+	if (dropped_reports > max_dropped_reports) {
+		max_dropped_reports = dropped_reports;
+	}
+	if (hid_type_byte1_is_tracker_id(data[0])) {
+		uint8_t tracker_id = data[1];
+		if (tracker_id < MAX_TRACKERS) {
+			tracker_drops[tracker_id]++;
+			total_tracker_drops[tracker_id]++;
+		}
+	}
 }
