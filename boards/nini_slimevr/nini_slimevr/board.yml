@@ -3,6 +3,7 @@
 
 board:
   name: nini_slimevr_uf2
+  full_name: NiNi SlimeVR Receiver
   vendor: nini_slimevr
   socs:
     - name: nrf52833
