@@ -98,6 +98,10 @@ static inline uint8_t esb_rf_channel_decode(uint8_t stored)
 #define ESB_PONG_FLAG_DATA_COLLECT_ON 0x22  // Start raw data collection
 #define ESB_PONG_FLAG_DATA_COLLECT_OFF 0x23 // Stop raw data collection
 #define ESB_PONG_FLAG_SENS_AUTO 0x24        // Auto-calibrate gyro sensitivity
+#define ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON 0x34  // Start batch raw data collection (data[8] = target Hz)
+#define ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF 0x35 // Stop batch raw data collection
+#define ESB_PONG_FLAG_METADATA_REQUEST 0x36 // Request selected metadata section/chunk
+#define ESB_METADATA_MASK_VALID 0x3F
 #define ESB_PONG_FLAG_MAG_AUTO_ON 0x25      // Enable online magnetometer calibration
 #define ESB_PONG_FLAG_MAG_AUTO_OFF 0x26     // Disable online magnetometer calibration
 #define ESB_PONG_FLAG_OTA_QUERY_INFO 0x30   // Request firmware info for ESB OTA
@@ -108,7 +112,9 @@ static inline uint8_t esb_rf_channel_decode(uint8_t stored)
 // Raw data collection packet types
 #define ESB_RAW_IMU_TYPE 0x10      // Raw IMU data (float, with piggybacked mag)
 #define ESB_RAW_MAG_TYPE 0x11      // Raw magnetometer data (float, reserved)
-#define ESB_RAW_META_TYPE 0x12     // Metadata (ODR, range, sensor IDs - sent once)
+// Metadata (ODR, range, sensor IDs): captured once per collection session,
+// sent at session start, and replayed on explicit requests.
+#define ESB_RAW_META_TYPE 0x12
 #define ESB_RAW_IMU_QUAT_TYPE 0x13 // Raw IMU with gyrQuat (52 bytes, packet-loss resistant)
 #define ESB_RAW_CAL_TYPE 0x14      // Extended calibration metadata (sub-typed)
 
@@ -154,6 +160,9 @@ uint32_t esb_get_stats_detailed_remaining(void);        // Get remaining time (0
 
 // Remote command API
 void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag);
+/* Clear only a pending OTA abort command; preserves unrelated commands. */
+void esb_clear_remote_ota_abort(uint8_t tracker_id);
+void esb_send_remote_command_arg(uint8_t tracker_id, uint8_t command_flag, uint8_t arg);
 /* Active-scan then queue. Returns bitmask of targeted tracker ids. Blocks ~1s. */
 uint32_t esb_send_remote_command_all(uint8_t command_flag);
 /* Targeted test commands: publish TPS, then queue the flag. Return the
@@ -167,6 +176,9 @@ void esb_send_remote_command_sens(uint8_t tracker_id, float x, float y, float z)
 bool esb_send_remote_command_sens_auto(uint8_t tracker_id, uint8_t axis, uint16_t revolutions);
 /* Active-scan then queue. Returns bitmask of targeted tracker ids. Blocks ~1s. */
 uint32_t esb_send_remote_command_sens_auto_all(uint8_t axis, uint16_t revolutions);
+/* Queue a metadata repair request without replacing an existing control flag.
+ * mask selects metadata sections; chunk selects a dense tcal block (0..254) or all (255). */
+bool esb_request_metadata(uint8_t tracker_id, uint8_t mask, uint8_t chunk);
 /* Returns 0 if started, -EINVAL bad channel, -EBUSY if another change pending. */
 int esb_set_all_trackers_channel(uint8_t channel);
 int esb_clear_all_trackers_channel(void);

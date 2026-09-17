@@ -172,15 +172,11 @@ void rssi_scan_run_and_print(void)
 	esb_deinitialize();
 	k_msleep(2);
 
-	// sweep_min[sweep][ch] = per-sweep minimum RSSI sample for that channel.
-	static uint8_t sweep_min[RSSI_SCAN_SWEEPS][RSSI_SCAN_LAST_CHANNEL + 1];
 	static uint8_t score_lowest[RSSI_SCAN_LAST_CHANNEL + 1];
 	static bool measured[RSSI_SCAN_LAST_CHANNEL + 1];
 
 	for (uint8_t ch = RSSI_SCAN_FIRST_CHANNEL; ch <= RSSI_SCAN_LAST_CHANNEL; ch++) {
-		for (int sweep = 0; sweep < RSSI_SCAN_SWEEPS; sweep++) {
-			sweep_min[sweep][ch] = RSSI_SAMPLE_MAX;
-		}
+		score_lowest[ch] = RSSI_SAMPLE_MAX;
 		measured[ch] = false;
 	}
 
@@ -191,7 +187,10 @@ void rssi_scan_run_and_print(void)
 				continue; // only preferred channels
 			}
 			measured[ch] = true;
-			sweep_min[sweep][ch] = rssi_scan_channel_measure_min_n(ch, RSSI_SCAN_SAMPLES_PER_CH);
+			uint8_t lowest = rssi_scan_channel_measure_min_n(ch, RSSI_SCAN_SAMPLES_PER_CH);
+			if (lowest < score_lowest[ch]) {
+				score_lowest[ch] = lowest;
+			}
 		}
 
 		// Yield to other threads/USB log processing.
@@ -200,23 +199,6 @@ void rssi_scan_run_and_print(void)
 		} else {
 			k_yield();
 		}
-	}
-
-	// Reduce sweeps into per-channel scores (only lowest).
-	for (uint8_t ch = RSSI_SCAN_FIRST_CHANNEL; ch <= RSSI_SCAN_LAST_CHANNEL; ch++) {
-		if (!measured[ch]) {
-			continue;
-		}
-		uint8_t lowest = RSSI_SAMPLE_MAX;
-
-		for (int sweep = 0; sweep < RSSI_SCAN_SWEEPS; sweep++) {
-			uint8_t v = sweep_min[sweep][ch];
-			if (v < lowest) {
-				lowest = v;
-			}
-		}
-
-		score_lowest[ch] = lowest;
 	}
 
 	uint8_t current_ch = get_current_effective_channel();

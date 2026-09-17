@@ -28,6 +28,10 @@ uint8_t rcv_cmd_stats(uint32_t duration_seconds);
 uint8_t rcv_cmd_resetstats(void);
 uint8_t rcv_cmd_collect_start(uint8_t tracker_id);
 uint8_t rcv_cmd_collect_stop(void);
+uint8_t rcv_cmd_collect_batch_start(uint16_t rate_hz);
+uint8_t rcv_cmd_collect_batch_stop(void);
+/* Queue selected metadata repair for one active tracker. */
+uint8_t rcv_cmd_collect_meta(uint8_t tracker_id, uint8_t mask, uint8_t chunk);
 uint8_t rcv_cmd_reboot(void);
 uint8_t rcv_cmd_dfu(bool ota);
 uint8_t rcv_cmd_tracker_channel_all(uint8_t channel);

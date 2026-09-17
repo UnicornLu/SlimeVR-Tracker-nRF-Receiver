@@ -33,7 +33,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/usb/class/usbd_hid.h>
 
-static struct k_work report_send;
+static struct k_work_delayable report_send;
 
 static struct tracker_report {
 	uint8_t data[16];
@@ -149,7 +149,9 @@ static bool hid_ready;
 static uint32_t hid_idle_duration_ms;
 
 #define HID_EP_BUSY_FLAG	0
-#define REPORT_PERIOD		K_MSEC(1) // streaming reports
+/* Coalesce newly queued records; retry only while a submission needs service. */
+#define REPORT_PERIOD		K_MSEC(1)
+#define HID_REGISTRATION_PERIOD K_MSEC(100)
 #define HID_EP_REPORT_COUNT 4
 #define HID_TPS_UPDATE_INTERVAL_MS 1000
 #define HID_STATS_POLL_INTERVAL_MS 200
@@ -310,10 +312,11 @@ static void send_report(struct k_work *work)
 	if (!receiver_usb_is_enabled()) return;
 	if (!receiver_usb_is_configured()) return;
 	if (!hid_ready) return;
-	if (!stored_trackers) return;
 
-	if (hid_fifo_is_empty() && k_uptime_get() - 100 < last_registration_sent) {
-		return; // send registrations only every 100ms
+	uint8_t tracker_count = stored_trackers;
+	bool fifo_empty = hid_fifo_is_empty();
+	if (fifo_empty && (tracker_count == 0 || k_uptime_get() - 100 < last_registration_sent)) {
+		return; // send registrations only every 100ms when trackers are stored
 	}
 
 	int ret;
@@ -323,9 +326,13 @@ static void send_report(struct k_work *work)
 
 		int epind = (int)reports_to_send;
 		for (; epind < HID_EP_REPORT_COUNT; epind++) {
-			if (stored_trackers > 0) {
+			if (tracker_count > 0) {
 				packet_device_addr(ep_report_buffer[epind].data, sent_device_addr);
-				sent_device_addr = (sent_device_addr + 1) % stored_trackers;
+				sent_device_addr = (sent_device_addr + 1) % tracker_count;
+			} else {
+				/* Use an unassigned type so hosts ignore empty slots, with no stale bytes. */
+				memset(ep_report_buffer[epind].data, 0, sizeof(ep_report_buffer[epind].data));
+				ep_report_buffer[epind].data[0] = 0xF8;
 			}
 		}
 
@@ -333,6 +340,7 @@ static void send_report(struct k_work *work)
 					       (uint8_t *)ep_report_buffer);
 
 		if (ret != 0) {
+			k_work_schedule(&report_send, REPORT_PERIOD);
 			atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
 			static int64_t last_err_log;
 			int64_t now = k_uptime_get();
@@ -343,6 +351,10 @@ static void send_report(struct k_work *work)
 		} else {
 			hid_fifo_consume(reports_to_send);
 			last_registration_sent = k_uptime_get();
+			/* Anchor idle registration to the last successful report, not to
+			 * an unrelated periodic phase after streaming becomes idle.
+			 */
+			k_timer_start(&event_timer, HID_REGISTRATION_PERIOD, HID_REGISTRATION_PERIOD);
 			if (reports_to_send > 0U) {
 				hid_stats_record_reports((uint32_t)reports_to_send);
 			}
@@ -536,6 +548,12 @@ static void int_in_ready_cb(const struct device *dev)
 			LOG_WRN("IN endpoint callback without preceding buffer write");
 		}
 	}
+	if (!hid_fifo_is_empty()) {
+		/* Backlog is already coalesced. Do not add another USB frame of
+		 * holdoff, even if a producer armed a later batching deadline.
+		 */
+		k_work_reschedule(&report_send, K_NO_WAIT);
+	}
 }
 
 static void input_report_done_cb(const struct device *dev, const uint8_t *const submitted_report)
@@ -561,6 +579,8 @@ static void iface_ready_cb(const struct device *dev, const bool ready)
 	hid_ready = ready;
 	if (!ready) {
 		atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
+	} else {
+		k_work_schedule(&report_send, REPORT_PERIOD);
 	}
 }
 
@@ -609,7 +629,7 @@ static void on_idle_cb(const struct device *dev, const uint8_t report_id, const 
 	}
 
 	hid_idle_duration_ms = duration;
-	k_work_submit(&report_send);
+	k_work_schedule(&report_send, REPORT_PERIOD);
 }
 
 static uint32_t get_idle_cb(const struct device *dev, const uint8_t report_id)
@@ -633,8 +653,10 @@ static void output_report_cb(const struct device *dev, const uint16_t len, const
 static void report_event_handler(struct k_timer *dummy)
 {
 	ARG_UNUSED(dummy);
-	if (receiver_usb_is_enabled()) {
-		k_work_submit(&report_send);
+	/* Registration heartbeat is the only periodic sender wakeup. */
+	if (stored_trackers > 0 && receiver_usb_is_enabled() &&
+	    receiver_usb_is_configured() && hid_ready) {
+		k_work_schedule(&report_send, K_NO_WAIT);
 	}
 }
 
@@ -653,6 +675,8 @@ static void hid_usb_state_changed(bool configured)
 	if (!configured) {
 		hid_ready = false;
 		atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
+	} else {
+		k_work_schedule(&report_send, REPORT_PERIOD);
 	}
 }
 
@@ -678,8 +702,8 @@ static int composite_pre_init(void)
 	}
 
 	hid_fifo_init();
-	k_work_init(&report_send, send_report);
-	k_timer_start(&event_timer, REPORT_PERIOD, REPORT_PERIOD);
+	k_work_init_delayable(&report_send, send_report);
+	k_timer_start(&event_timer, HID_REGISTRATION_PERIOD, HID_REGISTRATION_PERIOD);
 	receiver_usb_set_state_callback(hid_usb_state_changed);
 	rcv_cmd_set_async_ack(hid_async_cmd_ack);
 
@@ -752,6 +776,10 @@ void hid_write_packet_n(const uint8_t *data, uint8_t rssi)
 	}
 
 	if (hid_fifo_try_push(pkt, hid_fifo_is_priority(data[0]))) {
+		/* Every publication kicks, including a previously reserved MPSC head.
+		 * Schedule (not reschedule) keeps continuous producers from postponing TX.
+		 */
+		k_work_schedule(&report_send, REPORT_PERIOD);
 		return;
 	}
 
