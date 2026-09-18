@@ -25,6 +25,8 @@ Examples:
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict, deque
+import json
 import struct
 import sys
 import threading
@@ -66,6 +68,107 @@ RCV_HID_OP_DFU = 217
 RCV_HID_OP_TRACKER_CH_ALL = 218
 RCV_HID_OP_TRACKER_CH_CLR = 219
 RCV_HID_OP_NOP = 220
+RCV_HID_OP_TRACKER_EVENTS = 224
+RCV_HID_OP_TRACKER_EVENT = 225
+RCV_HID_OP_TRACKER_OBSERVATION = 226
+TRACKER_EVENT_VERSION = 1
+CALIBRATION_HEARTBEAT_MS = 2000
+CALIBRATION_SILENCE_MS = 10000
+REST_HEARTBEAT_MS = 5000
+REST_STALE_MS = 15000
+EVENT_LEASE_MS = 15000
+EVENT_RENEW_S = 5.0
+
+EVENT_KINDS = {
+    1: "IMU_ZRO", 2: "ACCEL_POSES", 3: "MAG_MANUAL", 4: "MAG_ONLINE",
+    5: "GYRO_SENS", 6: "TCAL_BOOT", 7: "TCAL_RUNTIME",
+    0x20: "TRACKER_REST", 0x21: "FUSION_REST", 0x30: "POWER", 0x31: "BUTTON",
+}
+EVENT_NAMES = dict(enumerate(
+    ("ACCEPTED", "BEGIN", "STEP", "END", "REJECTED", "STATE", "NOTICE"), 1
+))
+OUTCOME_NAMES = dict(enumerate(
+    ("NONE", "SUCCESS", "FAILED", "CANCELLED", "SKIPPED", "UNKNOWN")
+))
+CAL_PHASES = dict(enumerate((
+    "NONE", "IDENTIFY", "WAIT_STILL", "SENSOR_RETRIM", "COLLECT", "WAIT_POSE",
+    "CAPTURE_POSE", "POSE_DONE", "RETRY", "WAIT_ROTATION", "RECORD_ROTATION",
+    "FIT", "FREEZE", "VALIDATE", "PROBATION", "APPLY_PENDING", "APPLIED",
+    "CONFIRM", "STORAGE", "COVERAGE",
+)))
+CAL_REASONS = dict(enumerate((
+    "NONE", "BUSY", "UNSUPPORTED", "INVALID_ARGUMENT", "SENSOR_UNAVAILABLE",
+    "MOTION", "SAMPLE_TIMEOUT", "INSUFFICIENT_SAMPLES", "POSE_TIMEOUT",
+    "FIT_ERROR", "INVALID_MODEL", "QUALITY", "NO_BENEFIT", "ENVIRONMENT_ONLY",
+    "DISABLED", "REPLACED", "POWER_DOWN", "RESET", "STORAGE_ERROR",
+    "CANDIDATE_REJECTED", "NO_TCAL_COVERAGE", "START_TIMEOUT", "RECORD_TIMEOUT",
+    "TEMPERATURE", "RADIAL", "DIP", "COVERAGE", "EXPIRED", "INVALID_SAMPLE",
+    "OVERFLOW", "TRANSPORT_SILENCE", "SESSION_CHANGED", "PARTIAL",
+)))
+REST_REASONS = dict(enumerate(
+    ("OBSERVED", "RESET", "SUSPENDED", "NO_FRESH_FRAME", "INITIALIZING")
+))
+FUSION_BACKENDS = {0: "UNKNOWN", 1: "VQF", 2: "EQF"}
+KIND_MASKS = {"calibration": 1, "tracker-rest": 2, "fusion-rest": 4, "power": 8, "button": 16}
+
+
+def enum_name(names: dict[int, str], value: int) -> str:
+    return names.get(value, f"unknown_{value}")
+
+
+def decode_tracker_event(record: bytes, received_monotonic_ms: int | None = None) -> dict | None:
+    """Decode a private legacy 16-byte notification, never a v3 packet."""
+    if (len(record) != 16 or record[0] != RCV_HID_TYPE_CMD_ACK or record[1] != 0
+            or record[2] not in (RCV_HID_OP_TRACKER_EVENT, RCV_HID_OP_TRACKER_OBSERVATION)):
+        return None
+    event, outcome = record[3] & 15, record[3] >> 4
+    kind, phase, detail = record[13] & 0x7F, record[14], record[15]
+    calibration = 1 <= kind <= 7
+    phase_names = CAL_PHASES if calibration else {
+        0x20: {0: "NOT_REST", 1: "REST", 2: "UNKNOWN"},
+        0x21: {0: "NOT_REST_DETECTED", 1: "REST_DETECTED", 2: "UNKNOWN", 3: "UNAVAILABLE"},
+        0x30: {1: "WILL_WOM", 2: "WILL_SHUTDOWN"},
+        0x31: {1: "CLICK_GROUP"},
+    }.get(kind, {})
+    decoded_detail: int | str = detail
+    if calibration and (event in (4, 5) or phase in (8, 18)):
+        decoded_detail = enum_name(CAL_REASONS, detail)
+    elif kind == 0x20:
+        decoded_detail = enum_name(REST_REASONS, detail)
+    elif kind == 0x21:
+        decoded_detail = enum_name(FUSION_BACKENDS, detail)
+    elif kind == 0x30:
+        decoded_detail = enum_name({0: "UNKNOWN", 1: "WOM_NORMAL", 2: "WOM_FORCED"}, detail)
+    result = {
+        "source": "tracker" if record[2] == RCV_HID_OP_TRACKER_EVENT else "receiver",
+        "snapshot": record[2] == RCV_HID_OP_TRACKER_OBSERVATION and event == 6 and outcome == 0,
+        "origin": ("auto" if record[13] & 0x80 else "user") if calibration else None,
+        "tracker_id": record[4],
+        "boot_id": int.from_bytes(record[5:9], "little"),
+        "operation_id": int.from_bytes(record[11:13], "little"),
+        "event_seq": int.from_bytes(record[9:11], "little"),
+        "kind": enum_name(EVENT_KINDS, kind),
+        "event": enum_name(EVENT_NAMES, event),
+        "phase": enum_name(phase_names, phase),
+        "outcome": enum_name(OUTCOME_NAMES, outcome),
+        "detail": decoded_detail,
+        "received_monotonic_ms": (time.monotonic_ns() // 1_000_000
+                                  if received_monotonic_ms is None else received_monotonic_ms),
+    }
+    if kind == 0x31:
+        result.update(count=detail, count_exact=detail < 255)
+    if kind == 0x21:
+        result["backend"] = enum_name(FUSION_BACKENDS, detail)
+    return result
+
+
+def parse_kind_mask(text: str) -> int:
+    mask = 0
+    for name in text.split(","):
+        if name not in KIND_MASKS:
+            raise ValueError(f"unknown event kind: {name}")
+        mask |= KIND_MASKS[name]
+    return mask
 
 # ESB_PONG_FLAG_* (src/connection/esb.h) — full set except NORMAL / SET_CHANNEL / CLEAR_CHANNEL
 # Channel-all uses dongle opcodes 218/219 instead of 0x0A/0x0B.
@@ -156,25 +259,42 @@ def scale_sens(v: float) -> int:
 
 def enumerate_receivers() -> list[dict]:
     devices = hid.enumerate(VID, PID)
-    seen: set[bytes] = set()
-    unique = []
+    # A vendor data path must never be opened as the control interface, even
+    # when another enumeration row omits its usage page.
+    raw_paths = {d["path"] for d in devices if d.get("usage_page") == 0xFF00}
+    unique = {d["path"]: d for d in devices
+              if d["path"] not in raw_paths and d.get("usage_page") == 0x01}
     for d in devices:
-        path = d["path"]
-        if path not in seen:
-            seen.add(path)
-            unique.append(d)
-    return unique
+        if d.get("usage_page") not in (None, 0) or d["path"] in raw_paths:
+            continue
+        serial = d.get("serial_number")
+        if not serial:
+            continue
+        candidates = {item["path"] for item in devices
+                      if item.get("serial_number") == serial
+                      and item["path"] not in raw_paths
+                      and item.get("usage_page") in (0x01, None, 0)}
+        if len(candidates) == 1:
+            unique.setdefault(d["path"], d)
+    return list(unique.values())
 
 
 class HidCmdClient:
     def __init__(self, device_path: bytes | None = None):
+        if device_path is None:
+            devices = enumerate_receivers()
+            if len(devices) != 1:
+                raise ValueError("Select a unique main HID interface with --device N")
+            device_path = devices[0]["path"]
         self.dev = hid.device()
-        if device_path:
-            self.dev.open_path(device_path)
-        else:
-            self.dev.open(VID, PID)
-        self.dev.set_nonblocking(True)
-        print(f"Connected: {self.dev.get_product_string()}")
+        self.dev.open_path(device_path)
+        self.dev.set_nonblocking(False)
+        self.acks: dict[tuple[int, int], deque] = defaultdict(deque)
+        self.events: deque[dict] = deque()
+        self.subscription: tuple[int, int] | None = None
+        self.next_renew = 0.0
+        self.renewing = False
+        print(f"Connected: {self.dev.get_product_string()}", file=sys.stderr)
 
     def close(self) -> None:
         self.dev.close()
@@ -189,19 +309,81 @@ class HidCmdClient:
             return bytes(data)
         return None
 
+    def pump(self, timeout_ms: int = 100) -> bool:
+        """The sole HID reader: consume every complete record before dispatch."""
+        data = self._read(timeout_ms)
+        if not data:
+            return False
+        received_ms = time.monotonic_ns() // 1_000_000
+        for offset in range(0, min(len(data), REPORT_SIZE) - 15, 16):
+            record = data[offset:offset + 16]
+            notification = decode_tracker_event(record, received_ms)
+            if notification is not None:
+                self.events.append(notification)
+            elif record[0] == RCV_HID_TYPE_CMD_ACK and record[1] != 0:
+                self.acks[(record[1], record[2])].append((record[3], bytes(record[4:])))
+        return True
+
     def _wait_ack(self, seq: int, opcode: int, timeout_s: float) -> tuple[int, bytes]:
         deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            data = self._read(timeout_ms=50)
-            if not data:
-                continue
-            for offset in range(0, min(len(data), 64), 16):
-                sub = data[offset : offset + 16]
-                if len(sub) < 4:
-                    continue
-                if sub[0] == RCV_HID_TYPE_CMD_ACK and sub[1] == seq and sub[2] == opcode:
-                    return sub[3], bytes(sub[4:])
-        raise TimeoutError(f"No ACK for opcode {opcode} seq {seq}")
+        key = (seq, opcode)
+        while True:
+            if self.acks.get(key):
+                ack = self.acks[key].popleft()
+                if not self.acks[key]:
+                    del self.acks[key]
+                return ack
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"No ACK for opcode {opcode} seq {seq}")
+            self.renew_if_due()
+            self.pump(min(50, max(1, int(remaining * 1000))))
+
+    def event_control(self, action: int, target: int, mask: int) -> dict:
+        status, payload = self.command(
+            RCV_HID_OP_TRACKER_EVENTS, bytes((TRACKER_EVENT_VERSION, action, target, mask))
+        )
+        if status != RCV_HID_ST_OK:
+            raise RuntimeError(f"Event subscription: {STATUS_NAMES.get(status, status)} "
+                               "(older firmware may not support events)")
+        if len(payload) != 12 or payload[0] != TRACKER_EVENT_VERSION:
+            raise RuntimeError("Unsupported event subscription response")
+        return {
+            "version": payload[0], "capabilities": payload[1],
+            "max_repeats": payload[2], "spacing_ms": payload[3] * 10,
+            "calibration_heartbeat_ms": int.from_bytes(payload[4:6], "little"),
+            "calibration_silence_ms": int.from_bytes(payload[6:8], "little"),
+            "lease_ms": int.from_bytes(payload[8:10], "little"),
+            "filter": payload[10], "active": bool(payload[11] & 1),
+            "kind_mask": (payload[11] >> 1) & 31,
+        }
+
+    def subscribe(self, target: int, mask: int) -> None:
+        if target not in (*range(16), RCV_HID_TARGET_ALL):
+            raise ValueError("event target must be 0..15 or all")
+        if not 1 <= mask <= 31:
+            raise ValueError("event kind mask must be 1..31")
+        info = self.event_control(0, target, 0)
+        if not info["capabilities"] & 1:
+            raise RuntimeError("Receiver does not support tracker events")
+        self.event_control(1, target, mask)
+        self.subscription = target, mask
+        self.next_renew = time.monotonic() + EVENT_RENEW_S
+
+    def renew_if_due(self) -> None:
+        if self.subscription is None or self.renewing or time.monotonic() < self.next_renew:
+            return
+        self.renewing = True
+        try:
+            self.event_control(2, *self.subscription)
+            self.next_renew = time.monotonic() + EVENT_RENEW_S
+        finally:
+            self.renewing = False
+
+    def unsubscribe(self) -> None:
+        subscription, self.subscription = self.subscription, None
+        if subscription is not None:
+            self.event_control(3, subscription[0], 0)
 
     def command(
         self,
@@ -212,12 +394,13 @@ class HidCmdClient:
         completion_timeout_s: float = 35.0,
     ) -> tuple[int, bytes]:
         seq = next_seq()
+        self.acks.pop((seq, opcode), None)
         pkt = bytearray(REPORT_SIZE)
         pkt[0] = RCV_HID_TYPE_CMD
         pkt[1] = seq
         pkt[2] = opcode
         pkt[3] = 0
-        pkt[4 : 4 + len(args)] = args[:12]
+        pkt[4 : 4 + min(len(args), 12)] = args[:12]
         self._write(bytes(pkt))
 
         status, payload = self._wait_ack(seq, opcode, timeout_s)
@@ -264,6 +447,9 @@ def build_send(target: str, tokens: list[str]) -> tuple[int, bytes]:
         raise ValueError(f"Unknown mag subcommand: {sub}")
 
     # Compound: sens …
+    if cmd == "sens-auto" and rest:
+        return build_send(target, ["sens", "auto", *rest])
+
     if cmd == "sens":
         if not rest:
             raise ValueError(
@@ -623,6 +809,72 @@ def run_gui() -> int:
     return 0
 
 
+class CalibrationWatch:
+    """Association requires no concurrent same-kind operator on this tracker."""
+
+    def __init__(self, target: int, kind: int, sent_monotonic_ms: int):
+        self.target = target
+        self.kind = enum_name(EVENT_KINDS, kind)
+        self.sent_monotonic_ms = sent_monotonic_ms
+        self.operation: tuple[int, int] | None = None
+        self.result: int | None = None
+
+    def observe(self, event: dict) -> int | None:
+        if self.result is not None:
+            return self.result
+        if (self.target == RCV_HID_TARGET_ALL or event["tracker_id"] != self.target
+                or event["kind"] != self.kind or event["origin"] != "user"
+                or event["source"] != "tracker"
+                or event["received_monotonic_ms"] < self.sent_monotonic_ms):
+            return None
+        identity = event["boot_id"], event["operation_id"]
+        if self.operation is None:
+            if event["event"] == "REJECTED":
+                self.result = 1
+            elif event["event"] == "ACCEPTED":
+                self.operation = identity
+        elif identity == self.operation and event["event"] == "END":
+            if event["outcome"] in ("SUCCESS", "FAILED", "CANCELLED", "SKIPPED"):
+                self.result = 0 if event["outcome"] == "SUCCESS" else 1
+        return self.result
+
+
+def watch_events(client: HidCmdClient, target: int, mask: int,
+                 command: tuple[int, bytes] | None = None, kind: int | None = None) -> int:
+    try:
+        client.subscribe(target, mask)
+        association = None
+        if command is not None:
+            # Discard notifications already read before sending this request.
+            client.events.clear()
+            association = CalibrationWatch(target, kind, time.monotonic_ns() // 1_000_000)
+            print("Watching USER ACCEPTED → matching END; PING ACK is not completion. "
+                  "Requires no concurrent same-kind operator on the same tracker.",
+                  file=sys.stderr)
+            status, payload = client.command(*command)
+            print(f"Command ACK: {STATUS_NAMES.get(status, status)}", file=sys.stderr)
+            if status not in (RCV_HID_ST_OK, RCV_HID_ST_QUEUED, RCV_HID_ST_STARTED):
+                return 1
+        while True:
+            result = None
+            while client.events:
+                event = client.events.popleft()
+                print(json.dumps(event, separators=(",", ":")), flush=True)
+                if association is not None:
+                    result = association.observe(event)
+            if result is not None:
+                return result
+            client.renew_if_due()
+            client.pump(100)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        try:
+            client.unsubscribe()
+        except (Exception, KeyboardInterrupt) as exc:
+            print(f"Unsubscribe failed (lease expires automatically): {exc}", file=sys.stderr)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="SlimeNRF receiver HID control",
@@ -635,6 +887,8 @@ def main() -> int:
             "  send all mag auto off\n"
             "  send 0 sens 1.0,1.0,1.0\n"
             "  send 0 sens auto z 5\n"
+            "  send --watch-calibration 0 calibrate\n"
+            "  events-watch all --kinds calibration,tracker-rest,fusion-rest,power,button\n"
             "  send all sens reset\n"
             "  send 1 reset zro\n"
             "  send all tcal auto on\n"
@@ -686,12 +940,19 @@ def main() -> int:
     sub.add_parser("tracker-clearchannel")
 
     p_send = sub.add_parser("send")
+    p_send.add_argument("--watch-calibration", action="store_true",
+                        help="Subscribe before sending; wait for matching USER calibration END")
     p_send.add_argument("target", help="tracker id or 'all'")
     p_send.add_argument(
         "remote",
         nargs=argparse.REMAINDER,
         help="remote command tokens (meow | mag on | sens 1,1,1 | …)",
     )
+
+    p_events = sub.add_parser("events-watch", help="Stream tracker events as JSON until Ctrl-C")
+    p_events.add_argument("target", nargs="?", default="all", help="tracker 0..15 or all")
+    p_events.add_argument("--kinds", default=",".join(KIND_MASKS),
+                          help="Comma-separated calibration,tracker-rest,fusion-rest,power,button")
 
     p_flags = sub.add_parser("flags", help="List all tracker PONG flag names")
 
@@ -714,6 +975,8 @@ def main() -> int:
         print(f"No receivers (VID={VID:#06x} PID={PID:#06x})")
         return 1
     if args.device is not None:
+        if not 0 <= args.device < len(devices):
+            parser.error("--device index out of range")
         path = devices[args.device]["path"]
     elif len(devices) == 1:
         path = devices[0]["path"]
@@ -725,6 +988,8 @@ def main() -> int:
 
     client = HidCmdClient(path)
     try:
+        if args.cmd == "events-watch":
+            return watch_events(client, parse_target(args.target), parse_kind_mask(args.kinds))
         if args.cmd == "nop":
             st, pl = client.command(RCV_HID_OP_NOP)
         elif args.cmd == "info":
@@ -775,6 +1040,16 @@ def main() -> int:
             if tokens and tokens[0] == "--":
                 tokens = tokens[1:]
             opcode, payload = build_send(args.target, tokens)
+            if args.watch_calibration:
+                calibration_kinds = {
+                    PONG_FLAG["calibrate"]: 1, PONG_FLAG["6-side"]: 2,
+                    PONG_FLAG["mag-cal"]: 3, PONG_FLAG["sens-auto"]: 5,
+                }
+                if opcode not in calibration_kinds or tokens[0] == "raw":
+                    raise ValueError("--watch-calibration requires calibrate, 6-side, mag cal, "
+                                     "sens auto, or their flat aliases")
+                return watch_events(client, parse_target(args.target), 1,
+                                    (opcode, payload), calibration_kinds[opcode])
             wait_done = (
                 opcode <= 200
                 or opcode in (RCV_HID_OP_TRACKER_CH_ALL, RCV_HID_OP_TRACKER_CH_CLR)
@@ -788,7 +1063,7 @@ def main() -> int:
         print_status(st, pl)
         return 0 if st in (RCV_HID_ST_OK, RCV_HID_ST_QUEUED, RCV_HID_ST_STARTED) else 1
     except Exception as exc:
-        print(f"Error: {exc}")
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
     finally:
         client.close()

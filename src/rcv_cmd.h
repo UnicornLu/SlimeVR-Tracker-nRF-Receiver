@@ -53,7 +53,8 @@ uint8_t rcv_cmd_remote_sens_auto(uint8_t target_id, uint8_t axis, uint16_t revol
  * Process one HID type-254 command (first 16 bytes). Writes 16-byte ACK into ack_out.
  * Returns true if ack_out is valid and should be sent.
  */
-bool rcv_cmd_process_hid(const uint8_t *buf, size_t len, uint8_t ack_out[RCV_HID_CMD_LEN]);
+bool rcv_cmd_process_hid(const uint8_t *buf, size_t len, uint32_t usb_generation,
+			 uint8_t ack_out[RCV_HID_CMD_LEN]);
 
 /* Async completion ACKs (e.g. tracker channel-all). Registered by HID, not console. */
 typedef void (*rcv_cmd_async_ack_fn)(const uint8_t ack[RCV_HID_CMD_LEN]);

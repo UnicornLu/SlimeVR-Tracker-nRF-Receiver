@@ -17,6 +17,7 @@ This fork continues development alongside our [tracker firmware](https://github.
 - On-demand repair of missing collection metadata and calibration tables
 - Python tools for data collection, remote commands, and OTA updates
 - Optional per-tracker radio and clock-sync diagnostics
+- Explicit subscriptions for tracker calibration, rest, button, and power events
 
 Use matching tracker, receiver, and host-tool versions for fork-specific features.
 
@@ -76,6 +77,45 @@ state, and `32` temperature-table points. Chunk indices are zero-based, with two
 points per chunk; `255` requests all chunks. For example, `collectmeta 3 32 7`
 requests only chunk 7 from tracker 3, and `collectmeta 3 63 255` requests everything.
 Control HID opcode `223` carries the same three bytes: tracker ID, mask, chunk.
+
+## Tracker events
+
+Use matching tracker, receiver, and host-tool versions. The main HID interface
+supports an explicit, device-wide event subscription; raw-data HID is a separate
+interface. From this repository:
+
+```sh
+uv run scripts/hid_cmd.py events-watch all
+uv run scripts/hid_cmd.py events-watch 0 --kinds tracker-rest,fusion-rest,button
+uv run scripts/hid_cmd.py send --watch-calibration 0 calibrate
+uv run scripts/hid_cmd.py send --watch-calibration 0 mag cal
+uv run scripts/hid_cmd.py send --watch-calibration 0 sens auto z 5
+```
+
+`events-watch` emits one JSON object per event. Available kind filters are
+`calibration`, `tracker-rest`, `fusion-rest`, `power`, and `button`; all are
+enabled by default. The client renews its 15-second lease every five seconds and
+attempts to unsubscribe on Ctrl-C. A new subscription can receive fresh current
+rest snapshots, but does not replay previous button actions, power intentions,
+or calibration results. The lease is device-wide, not a multi-client router.
+
+`send --watch-calibration` subscribes before sending a supported calibration
+command and associates its user-origin `ACCEPTED` operation with the resulting
+`END`. Put this option before the target, as shown above. Do not start a second
+calibration of the same kind on the same tracker from another operator while
+watching: this protocol has no request token for disambiguating that case.
+Command ACK means receipt, not successful calibration. Receiver `UNKNOWN`
+observations do not finish the watch or automatically retry calibration.
+
+Events are bounded and best-effort. Three copies at most are not a delivery
+guarantee, and sequence gaps are not an RF-loss or missed-click counter.
+Calibration `SUCCESS` at `APPLIED` describes live coefficients, not proof of
+flash persistence. Silence produces a receiver observation with `UNKNOWN`, not
+a fabricated tracker failure. Rest states are coalesced current observations,
+not a complete edge history; fusion not detecting rest does not mean motion.
+Button `count_exact=false` with `count=255` means at least 255 recognized
+presses. `WILL_WOM` and `WILL_SHUTDOWN` are intentions only, and actual power
+transitions do not wait for notification delivery.
 
 ## License
 Unless otherwise specified, all code in this repository is dual-licensed under either:

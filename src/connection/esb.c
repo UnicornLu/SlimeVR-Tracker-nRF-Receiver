@@ -34,6 +34,8 @@
 #include "system/system.h"
 #include "data_collect.h"
 #include "esb_ota.h"
+#include "tracker_events.h"
+#include "tracker_event_protocol.h"
 
 LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 
@@ -1788,6 +1790,20 @@ static void esb_ack_handler_cb(
 	}
 }
 
+static int composite_body_length(uint8_t type)
+{
+	switch (type) {
+	case 0: return 13; /* info */
+	case 1: return 14; /* quat+accel */
+	case 2: return 13; /* compact quat */
+	case 3: return 2;  /* status */
+	case 4: return 14; /* quat+mag */
+	case 5: return 8;  /* runtime */
+	case TRACKER_EVENT_ESB_TYPE: return TRACKER_EVENT_BODY_LEN;
+	default: return -1;
+	}
+}
+
 void event_handler(struct esb_evt const *event)
 {
 	switch (event->evt_id) {
@@ -1810,6 +1826,23 @@ void event_handler(struct esb_evt const *event)
 				break;
 			}
 			uint32_t current_rx_ticks = k_uptime_ticks();
+			if (rx_payload.length == 0) {
+				continue;
+			}
+			/* Discovery has a checksum byte, not a packet type. */
+			bool discovery = rx_payload.pipe == 0 && rx_payload.length == 8;
+			/* Private events never enter pose sequence or ACK accounting. */
+			if (!discovery && rx_payload.data[0] == TRACKER_EVENT_ESB_TYPE) {
+				if (rx_payload.length == TRACKER_EVENT_ESB_LEN
+				    && rx_payload.data[1] < stored_trackers
+				    && rx_payload.data[1] < MAX_TRACKERS) {
+					tracker_events_receive(rx_payload.data, rx_payload.length, k_uptime_get_32());
+				}
+				continue;
+			}
+			if (!discovery && rx_payload.data[0] == ESB_COMPOSITE_TYPE) {
+				goto handle_composite_packet;
+			}
 			switch (rx_payload.length) {
 			case 1: // ACK packet
 				LOG_DBG("RX ACK len=%u pipe=%u data=%02X", rx_payload.length, rx_payload.pipe, rx_payload.data[0]);
@@ -2321,21 +2354,16 @@ void event_handler(struct esb_evt const *event)
 			} break;
 			case 17: // 16 bytes data + 1 byte sequence number
 			{
-				if (rx_payload.data[0] == ESB_COMPOSITE_TYPE) {
-					goto handle_composite_packet;
+				if (rx_payload.data[0] > 223) {
+					break;
 				}
-
 				uint8_t tracker_id = rx_payload.data[1];
 
 				// TDMA Slot Check for Data (Type 17)
 				tdma_check_slot(tracker_id, current_rx_ticks, rx_payload.rssi);
 
-				if (tracker_id >= stored_trackers) { // not a stored tracker
+				if (tracker_id >= stored_trackers || tracker_id >= MAX_TRACKERS) {
 					continue;
-				}
-
-				if (rx_payload.data[0] > 223) { // reserved for receiver only
-					break;
 				}
 
 				uint8_t received_sequence = rx_payload.data[16];
@@ -2430,12 +2458,57 @@ void event_handler(struct esb_evt const *event)
 				uint8_t tracker_id = rx_payload.data[1];
 				uint8_t sub_count = rx_payload.data[2];
 
-				// TDMA Slot Check for Composite Packet
-				tdma_check_slot(tracker_id, current_rx_ticks, rx_payload.rssi);
-
-				if (tracker_id >= stored_trackers) {
+				if (tracker_id >= stored_trackers || tracker_id >= MAX_TRACKERS) {
 					continue;
 				}
+
+				/* Validate known records before side effects. Unknown legacy tails
+				 * stop parsing, preserving the known prefix and pose accounting.
+				 * A reachable E0 must still be a valid, exact final record. */
+				int scan = 3;
+				int event_pos = 0;
+				int frame_end = rx_payload.length - 1;
+				bool valid = sub_count != 0;
+				bool unknown_tail = false;
+				for (int i = 0; valid && i < sub_count; i++) {
+					if (scan >= frame_end) {
+						valid = false;
+						break;
+					}
+					uint8_t type = rx_payload.data[scan++];
+					int body_len = composite_body_length(type);
+					if (body_len < 0) {
+						unknown_tail = true;
+						break;
+					}
+					if (scan + body_len > frame_end) {
+						valid = false;
+						break;
+					}
+					if (type == TRACKER_EVENT_ESB_TYPE) {
+						struct tracker_event decoded;
+						valid = i == sub_count - 1
+							&& tracker_event_decode_body(tracker_id, &rx_payload.data[scan],
+							                            body_len, &decoded);
+						event_pos = scan;
+					}
+					scan += body_len;
+				}
+				if (!valid || (!unknown_tail && scan != frame_end)) {
+					break;
+				}
+				if (event_pos != 0) {
+					uint8_t event_packet[TRACKER_EVENT_ESB_LEN] = {
+						TRACKER_EVENT_ESB_TYPE, tracker_id
+					};
+					memcpy(&event_packet[2], &rx_payload.data[event_pos], TRACKER_EVENT_BODY_LEN);
+					tracker_events_receive(event_packet, sizeof(event_packet), k_uptime_get_32());
+					/* Event retries have their own sequence and are not pose evidence. */
+					if (--sub_count == 0) {
+						break;
+					}
+				}
+				tdma_check_slot(tracker_id, current_rx_ticks, rx_payload.rssi);
 
 				LOG_DBG("Received composite packet from tracker %d with %d sub-packets", tracker_id, sub_count);
 
@@ -2470,33 +2543,7 @@ void event_handler(struct esb_evt const *event)
 
 				for (int i = 0; i < sub_count && pos < end; i++) {
 					uint8_t sub_type = rx_payload.data[pos++];
-					int sub_len;
-
-					/* Determine sub-packet data length */
-					switch (sub_type) {
-					case 0:
-						sub_len = 13;
-						break; /* info */
-					case 1:
-						sub_len = 14;
-						break; /* quat+accel */
-					case 2:
-						sub_len = 13;
-						break; /* compact quat */
-					case 3:
-						sub_len = 2;
-						break; /* status */
-					case 4:
-						sub_len = 14;
-						break; /* quat+mag */
-					case 5:
-						sub_len = 8;
-						break; /* runtime */
-					default:
-						LOG_ERR("Unknown composite sub-type: %d", sub_type);
-						sub_len = -1;
-						break;
-					}
+					int sub_len = composite_body_length(sub_type);
 
 					if (sub_len < 0 || pos + sub_len > end) {
 						break;
@@ -2744,11 +2791,15 @@ int esb_add_pair(uint64_t addr, bool checksum)
 			return -ENOSPC;
 		}
 		assigned_id = stored_trackers;
+		unsigned int key = irq_lock();
+		tracker_events_pairing_invalidate(BIT(assigned_id));
 		// Write addr first, then barrier, then increment count
 		// This ensures ISR lockless reads see consistent data
 		stored_tracker_addr[assigned_id] = addr;
 		__asm__ volatile("" ::: "memory"); // compiler barrier
 		stored_trackers = assigned_id + 1;
+		irq_unlock(key);
+		tracker_events_pairing_cleanup();
 		new_entry = true;
 	}
 
@@ -2791,11 +2842,15 @@ void esb_pop_pair(void)
 	if (stored_trackers > 0) {
 		removed_id = stored_trackers - 1;
 		removed_addr = stored_tracker_addr[removed_id];
+		unsigned int key = irq_lock();
 		// Zero entry first, then barrier, then decrement count
 		// This ensures ISR lockless reads never match a removed entry
 		stored_tracker_addr[removed_id] = 0;
 		__asm__ volatile("" ::: "memory"); // compiler barrier
 		stored_trackers = (uint8_t)removed_id;
+		tracker_events_pairing_invalidate(BIT(removed_id));
+		irq_unlock(key);
+		tracker_events_pairing_cleanup();
 	}
 	k_mutex_unlock(&tracker_store_lock);
 
@@ -2932,10 +2987,14 @@ void esb_clear(void)
 
 	k_mutex_lock(&tracker_store_lock, K_FOREVER);
 	uint8_t previous_count = stored_trackers;
+	unsigned int key = irq_lock();
 	// Set count to 0 first — ISR immediately stops reading the array
 	stored_trackers = 0;
 	__asm__ volatile("" ::: "memory"); // compiler barrier
 	memset(stored_tracker_addr, 0, sizeof(stored_tracker_addr));
+	tracker_events_pairing_invalidate(BIT(MIN(previous_count, MAX_TRACKERS)) - 1U);
+	irq_unlock(key);
+	tracker_events_pairing_cleanup();
 	k_mutex_unlock(&tracker_store_lock);
 
 	// Async NVS writes
@@ -3865,6 +3924,7 @@ static void esb_thread(void)
 	}
 
 	while (1) {
+		tracker_events_process(k_uptime_get_32());
 		// Process new device pairing requests (non-blocking)
 		if (esb_pairing) {
 			process_pairing_queue();

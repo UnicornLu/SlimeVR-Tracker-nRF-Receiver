@@ -28,6 +28,7 @@
 #include "rcv_cmd.h"
 #include "rcv_hid_cmd.h"
 #include "usb.h"
+#include "tracker_events.h"
 
 #include <limits.h>
 #include <zephyr/kernel.h>
@@ -54,6 +55,8 @@ BUILD_ASSERT((MAX_REPORTS & (MAX_REPORTS - 1)) == 0, "MAX_REPORTS must be power 
  */
 struct hid_fifo_slot {
 	uint8_t data[16];
+	/* Zero identifies ordinary records, which never undergo lease filtering. */
+	uint32_t subscription_generation;
 	atomic_t seq;
 };
 
@@ -75,7 +78,7 @@ static bool hid_fifo_is_priority(uint8_t type)
 	return type == RCV_HID_TYPE_CMD_ACK || (type >= 0xF0 && type <= 0xF7);
 }
 
-static bool hid_fifo_try_push(const uint8_t data[16], bool priority)
+static bool hid_fifo_try_push(const uint8_t data[16], bool priority, uint32_t generation)
 {
 	uint32_t pos;
 
@@ -102,12 +105,13 @@ static bool hid_fifo_try_push(const uint8_t data[16], bool priority)
 	 * means slot is ready. Never spin here — producers include ESB EVENT IRQ.
 	 */
 	memcpy(slot->data, data, sizeof(slot->data));
+	slot->subscription_generation = generation;
 	atomic_set(&slot->seq, (atomic_val_t)(pos + 1));
 	return true;
 }
 
 /* Peek without consuming — consume only after USB submit succeeds. */
-static size_t hid_fifo_peek_batch(struct tracker_report *out, size_t max)
+static size_t hid_fifo_peek_batch(struct tracker_report *out, uint32_t *generations, size_t max)
 {
 	size_t n = 0;
 	uint32_t read = (uint32_t)atomic_get(&hid_fifo_read_pos);
@@ -119,6 +123,7 @@ static size_t hid_fifo_peek_batch(struct tracker_report *out, size_t max)
 			break;
 		}
 		memcpy(out[n].data, slot->data, sizeof(out[n].data));
+		generations[n] = slot->subscription_generation;
 		n++;
 	}
 	return n;
@@ -307,6 +312,18 @@ uint32_t hid_get_total_tracker_drop_count(uint8_t tracker_id)
 }
 
 
+static void hid_fill_padding(struct tracker_report *out, uint8_t tracker_count)
+{
+	if (tracker_count > 0) {
+		sent_device_addr %= tracker_count;
+		packet_device_addr(out->data, sent_device_addr);
+		sent_device_addr = (sent_device_addr + 1) % tracker_count;
+	} else {
+		memset(out->data, 0, sizeof(out->data));
+		out->data[0] = 0xF8;
+	}
+}
+
 static void send_report(struct k_work *work)
 {
 	if (!receiver_usb_is_enabled()) return;
@@ -322,17 +339,23 @@ static void send_report(struct k_work *work)
 	int ret;
 
 	if (!atomic_test_and_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
-		size_t reports_to_send = hid_fifo_peek_batch(ep_report_buffer, HID_EP_REPORT_COUNT);
+		uint32_t generations[HID_EP_REPORT_COUNT];
+		size_t reports_to_send = hid_fifo_peek_batch(ep_report_buffer, generations,
+							    HID_EP_REPORT_COUNT);
 
 		int epind = (int)reports_to_send;
 		for (; epind < HID_EP_REPORT_COUNT; epind++) {
-			if (tracker_count > 0) {
-				packet_device_addr(ep_report_buffer[epind].data, sent_device_addr);
-				sent_device_addr = (sent_device_addr + 1) % tracker_count;
-			} else {
-				/* Use an unassigned type so hosts ignore empty slots, with no stale bytes. */
-				memset(ep_report_buffer[epind].data, 0, sizeof(ep_report_buffer[epind].data));
-				ep_report_buffer[epind].data[0] = 0xF8;
+			hid_fill_padding(&ep_report_buffer[epind], tracker_count);
+		}
+
+		/* Recheck immediately before submission, including every retry. An
+		 * invalid entry is consumed only when its replacement is submitted.
+		 */
+		uint32_t now_ms = k_uptime_get_32();
+		for (size_t i = 0; i < reports_to_send; i++) {
+			if (generations[i] != 0 &&
+			    !tracker_events_hid_valid(ep_report_buffer[i].data, generations[i], now_ms)) {
+				hid_fill_padding(&ep_report_buffer[i], tracker_count);
 			}
 		}
 
@@ -463,7 +486,7 @@ void hid_reset_all_rssi_smooth(void)
 /* Below ESB_THREAD_PRIORITY; must not compete with radio housekeeping. */
 K_THREAD_DEFINE(hid_dropped_reports_logging_thread, 256, hid_dropped_reports_logging, NULL, NULL, NULL, HID_DROPPED_REPORTS_LOGGING_PRIORITY, 0, 0);
 
-static void handle_output_report(const uint8_t *buf, uint16_t len)
+static void handle_output_report(const uint8_t *buf, uint16_t len, uint32_t usb_generation)
 {
 	if (len == 0) {
 		return;
@@ -481,7 +504,7 @@ static void handle_output_report(const uint8_t *buf, uint16_t len)
 
 	if (report_type == RCV_HID_TYPE_CMD) {
 		uint8_t ack[RCV_HID_CMD_LEN];
-		if (rcv_cmd_process_hid(buf, len, ack)) {
+		if (rcv_cmd_process_hid(buf, len, usb_generation, ack)) {
 			hid_write_packet_n(ack, 0);
 		}
 	}
@@ -491,6 +514,7 @@ static void handle_output_report(const uint8_t *buf, uint16_t len)
 struct hid_cmd_msg {
 	uint8_t len;
 	uint8_t data[RCV_HID_CMD_LEN];
+	uint32_t usb_generation;
 };
 
 K_MSGQ_DEFINE(hid_cmd_msgq, sizeof(struct hid_cmd_msg), 4, 4);
@@ -501,7 +525,7 @@ static void hid_cmd_work_handler(struct k_work *work)
 	struct hid_cmd_msg msg;
 
 	while (k_msgq_get(&hid_cmd_msgq, &msg, K_NO_WAIT) == 0) {
-		handle_output_report(msg.data, msg.len);
+		handle_output_report(msg.data, msg.len, msg.usb_generation);
 	}
 }
 
@@ -515,6 +539,7 @@ static void enqueue_hid_cmd(const uint8_t *buf, uint16_t len)
 		return;
 	}
 	msg.len = (uint8_t)MIN(len, sizeof(msg.data));
+	msg.usb_generation = tracker_events_usb_generation();
 	memcpy(msg.data, buf, msg.len);
 	if (k_msgq_put(&hid_cmd_msgq, &msg, K_NO_WAIT) != 0) {
 		LOG_WRN("HID CMD queue full, dropping");
@@ -534,7 +559,7 @@ static void dispatch_output_report(const uint8_t *buf, uint16_t len)
 		enqueue_hid_cmd(buf, len);
 		return;
 	}
-	handle_output_report(buf, len);
+	handle_output_report(buf, len, tracker_events_usb_generation());
 }
 
 static void int_in_ready_cb(const struct device *dev)
@@ -578,6 +603,7 @@ static void iface_ready_cb(const struct device *dev, const bool ready)
 
 	hid_ready = ready;
 	if (!ready) {
+		tracker_events_usb_reset();
 		atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
 	} else {
 		k_work_schedule(&report_send, REPORT_PERIOD);
@@ -673,6 +699,7 @@ static const struct hid_device_ops ops = {
 static void hid_usb_state_changed(bool configured)
 {
 	if (!configured) {
+		tracker_events_usb_reset();
 		hid_ready = false;
 		atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
 	} else {
@@ -753,6 +780,39 @@ static bool hid_type_has_rssi_slot(uint8_t type)
 	return hid_type_byte1_is_tracker_id(type);
 }
 
+static bool hid_enqueue_packet(const uint8_t data[16], uint32_t generation)
+{
+	if (hid_fifo_try_push(data, hid_fifo_is_priority(data[0]), generation)) {
+		/* Schedule, not reschedule: continuous producers cannot postpone TX. */
+		k_work_schedule(&report_send, REPORT_PERIOD);
+		return true;
+	}
+
+	/* Count only; producers may run in the radio IRQ. */
+	total_dropped_reports++;
+	dropped_reports++;
+	if (dropped_reports > max_dropped_reports) {
+		max_dropped_reports = dropped_reports;
+	}
+	if (hid_type_byte1_is_tracker_id(data[0])) {
+		uint8_t tracker_id = data[1];
+		if (tracker_id < MAX_TRACKERS) {
+			tracker_drops[tracker_id]++;
+			total_tracker_drops[tracker_id]++;
+		}
+	}
+	return false;
+}
+
+bool hid_write_tracker_event(const uint8_t record[16], uint32_t generation)
+{
+	if (generation == 0) {
+		return false;
+	}
+	/* Type 251 already has priority and no RSSI slot: preserve all 16 bytes. */
+	return hid_enqueue_packet(record, generation);
+}
+
 void hid_write_packet_n(const uint8_t *data, uint8_t rssi)
 {
 	uint8_t pkt[16];
@@ -775,25 +835,5 @@ void hid_write_packet_n(const uint8_t *data, uint8_t rssi)
 		}
 	}
 
-	if (hid_fifo_try_push(pkt, hid_fifo_is_priority(data[0]))) {
-		/* Every publication kicks, including a previously reserved MPSC head.
-		 * Schedule (not reschedule) keeps continuous producers from postponing TX.
-		 */
-		k_work_schedule(&report_send, REPORT_PERIOD);
-		return;
-	}
-
-	/* Count only — LOG from hid_dropped_reports_logging thread, never EVENT IRQ. */
-	total_dropped_reports++;
-	dropped_reports++;
-	if (dropped_reports > max_dropped_reports) {
-		max_dropped_reports = dropped_reports;
-	}
-	if (hid_type_byte1_is_tracker_id(data[0])) {
-		uint8_t tracker_id = data[1];
-		if (tracker_id < MAX_TRACKERS) {
-			tracker_drops[tracker_id]++;
-			total_tracker_drops[tracker_id]++;
-		}
-	}
+	(void)hid_enqueue_packet(pkt, 0);
 }

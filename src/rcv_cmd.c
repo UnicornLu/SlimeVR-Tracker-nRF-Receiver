@@ -11,6 +11,7 @@
 #include "esb_ota.h"
 #include "globals.h"
 #include "system/system.h"
+#include "tracker_events.h"
 
 #include <errno.h>
 #include <string.h>
@@ -775,7 +776,8 @@ static int rcv_cmd_register_esb_cbs(void)
 
 SYS_INIT(rcv_cmd_register_esb_cbs, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
 
-bool rcv_cmd_process_hid(const uint8_t *buf, size_t len, uint8_t ack_out[RCV_HID_CMD_LEN])
+bool rcv_cmd_process_hid(const uint8_t *buf, size_t len, uint32_t usb_generation,
+			 uint8_t ack_out[RCV_HID_CMD_LEN])
 {
 	if (buf == NULL || ack_out == NULL || len < 4 || buf[0] != RCV_HID_TYPE_CMD) {
 		return false;
@@ -787,6 +789,31 @@ bool rcv_cmd_process_hid(const uint8_t *buf, size_t len, uint8_t ack_out[RCV_HID
 	size_t args_len = (len > 4) ? (len - 4) : 0;
 	if (args_len > 12) {
 		args_len = 12;
+	}
+
+	if (opcode == RCV_HID_OP_TRACKER_EVENTS) {
+		fill_ack(ack_out, seq, opcode, RCV_HID_ST_EINVAL);
+		if (buf[3] != 0) {
+			return true;
+		}
+		/* Core checks USB generation under the same lock as lease mutation. */
+		int err = tracker_events_control(args, args_len, usb_generation, &ack_out[4]);
+		switch (err) {
+		case 0:
+			ack_out[3] = RCV_HID_ST_OK;
+			break;
+		case -ENOTSUP:
+			ack_out[3] = RCV_HID_ST_ENOTSUP;
+			break;
+		case -ENOENT:
+		case -ENOTCONN:
+			ack_out[3] = RCV_HID_ST_ENOENT;
+			break;
+		default:
+			ack_out[3] = RCV_HID_ST_EINVAL;
+			break;
+		}
+		return true;
 	}
 
 	LOG_INF("HID cmd seq=%u opcode=0x%02X args_len=%u", seq, opcode, (unsigned)args_len);
@@ -837,6 +864,11 @@ bool rcv_cmd_process_hid(const uint8_t *buf, size_t len, uint8_t ack_out[RCV_HID
 		}
 	} else {
 		switch (opcode) {
+		case RCV_HID_OP_TRACKER_EVENT:
+		case RCV_HID_OP_TRACKER_OBSERVATION:
+			/* Notification opcodes have no host-to-device operation. */
+			status = RCV_HID_ST_EINVAL;
+			break;
 		case RCV_HID_OP_NOP:
 			status = RCV_HID_ST_OK;
 			break;

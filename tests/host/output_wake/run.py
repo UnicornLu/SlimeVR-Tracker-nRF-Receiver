@@ -6,6 +6,7 @@ No source-text assertions: all cases exercise queue, scheduler, USB and UART beh
 """
 import argparse
 import os
+import importlib.util
 from pathlib import Path
 import re
 import shlex
@@ -86,6 +87,8 @@ static struct k_work *works[16];
 static struct k_timer *timers[16];
 static size_t nworks, ntimers;
 static int64_t now;
+uint32_t host_now;
+static uint32_t k_uptime_get_32(void) { return (uint32_t)now; }
 static int64_t k_uptime_get(void) { return now; }
 static int64_t k_uptime_ticks(void) { return now * 32; }
 static void k_work_init(struct k_work *w, void (*fn)(struct k_work *)) { w->handler=fn; }
@@ -115,6 +118,7 @@ static void advance(int delta) {
         for (size_t i=0; i<ntimers; i++) if (timers[i]->active && timers[i]->due<due) due=timers[i]->due;
         if (due>end) break;
         now=due;
+        host_now=(uint32_t)now;
         for (size_t i=0; i<ntimers; i++) {
             struct k_timer *t=timers[i];
             if (t->active && t->due==now) { t->runs++; t->active=t->period!=0; t->due+=t->period; t->handler(t); }
@@ -125,6 +129,7 @@ static void advance(int delta) {
         }
     }
     now=end;
+    host_now=(uint32_t)now;
 }
 #define DT_NODELABEL(x) 0
 #define DEVICE_DT_GET(x) (&device)
@@ -134,12 +139,16 @@ static bool device_is_ready(const struct device *dev) { return true; }
 hid_source = (src / 'hid.c').read_text()
 hid_decls = hid_source[hid_source.index('static struct k_work'):hid_source.index('static const uint8_t hid_report_desc')]
 hid_functions = '\n'.join(function(hid_source, name) for name in [
-    'packet_device_addr', 'hid_stats_record_reports', 'send_report',
+    'packet_device_addr', 'hid_stats_record_reports', 'hid_fill_padding', 'send_report',
     'int_in_ready_cb', 'input_report_done_cb', 'iface_ready_cb',
     'report_event_handler', 'hid_usb_state_changed', 'composite_pre_init',
-    'hid_write_packet_n'])
+    'hid_type_byte1_is_tracker_id', 'hid_type_has_rssi_slot',
+    'hid_enqueue_packet', 'hid_write_tracker_event', 'hid_write_packet_n'])
 hid = common + r'''
 #define RCV_HID_TYPE_CMD_ACK 251
+#define RCV_HID_TYPE_CMD 254
+#include "tracker_events.h"
+#include "connection/tracker_event_protocol.h"
 #define RCV_HID_TYPE_DEVICE_ADDR 255
 #define RCV_HID_CMD_LEN 16
 static uint8_t stored_trackers;
@@ -157,8 +166,6 @@ static uint16_t sent_device_addr;
 static int64_t last_registration_sent;
 static uint32_t dropped_reports, max_dropped_reports, total_dropped_reports;
 static uint32_t tracker_drops[MAX_TRACKERS], total_tracker_drops[MAX_TRACKERS];
-static bool hid_type_has_rssi_slot(uint8_t t) { return false; }
-static bool hid_type_byte1_is_tracker_id(uint8_t t) { return t<8; }
 static int8_t rssi_smooth_update(uint8_t id, int8_t rssi) { return rssi; }
 static uint8_t submitted[128][64];
 static const uint8_t *inflight;
@@ -175,6 +182,21 @@ static void publish(unsigned id, uint8_t type) { uint8_t p[16]={0}; p[0]=type; p
 static void done(void) { assert(inflight); const uint8_t *p=inflight; inflight=NULL; input_report_done_cb(hdev, p); }
 static void setup(void) { assert(composite_pre_init()==0); iface_ready_cb(hdev, true); hid_usb_state_changed(true); advance(2); }
 static void publish_behind_reserved_head(void) { publish(1,240); advance(2); assert(submissions==0); }
+static uint32_t event_record(uint8_t record[16]) {
+    uint8_t args[]={1,1,255,31}, result[12];
+    assert(tracker_events_control(args,4,tracker_events_usb_generation(),result)==0);
+    /* Capture the real generation by peeking the actual event producer. */
+    struct tracker_event e={.nonce=1,.tracker_id=2,.operation_id=1,.event_seq=1,
+        .kind=CAL_KIND_IMU_ZRO,.event=CAL_EVENT_BEGIN,.phase=CAL_PHASE_COLLECT};
+    uint8_t wire[17]; assert(tracker_event_encode(wire,&e));
+    assert(tracker_events_receive(wire,17,(uint32_t)now));
+    tracker_events_process((uint32_t)now);
+    struct tracker_report out;
+    uint32_t generation;
+    assert(hid_fifo_peek_batch(&out,&generation,1)==1);
+    memcpy(record,out.data,16);
+    return generation;
+}
 int main(int argc, char **argv) {
     assert(argc==2); setup();
     if (!strcmp(argv[1], "hid-idle")) {
@@ -231,6 +253,32 @@ int main(int argc, char **argv) {
         stored_trackers=1; publish(1,240); advance(2); assert(submissions==1); done();
         int64_t sent_at=last_registration_sent; advance(98); assert(submissions==1);
         advance(3); assert(submissions==2); assert(last_registration_sent-sent_at<=101); assert(submitted[1][0]==255);
+    } else if (!strcmp(argv[1], "hid-event-stale-retry")) {
+        k_timer_stop(&event_timer);
+        uint8_t expected[16]; event_record(expected);
+        failures=1; advance(1);
+        assert(attempts==1 && submissions==0 && !hid_fifo_is_empty());
+        tracker_events_usb_reset();
+        advance(1); assert(submissions==1 && hid_fifo_is_empty());
+        for (unsigned i=0;i<4;i++) assert(submitted[0][i*16]==0xf8);
+    } else if (!strcmp(argv[1], "hid-event-valid-retry")) {
+        k_timer_stop(&event_timer);
+        uint8_t expected[16]; event_record(expected);
+        failures=1; advance(1);
+        assert(submissions==0 && !hid_fifo_is_empty());
+        advance(1); assert(submissions==1 && hid_fifo_is_empty());
+        assert(!memcmp(submitted[0],expected,16));
+    } else if (!strcmp(argv[1], "hid-event-classification")) {
+        k_timer_stop(&event_timer);
+        uint8_t event[16]; uint32_t generation=event_record(event);
+        assert(generation!=0);
+        tracker_events_usb_reset();
+        uint8_t ack[16]={251,0,225,0,0xff,1,2,3,4,5,6,7,8,9,10,0xab};
+        hid_write_packet_n(ack,0x55);
+        advance(1); assert(submissions==1);
+        assert(submitted[0][0]==0xf8 && !memcmp(submitted[0]+16,ack,16));
+        assert(!hid_type_byte1_is_tracker_id(251) && !hid_type_has_rssi_slot(251));
+        assert(total_tracker_drops[0]==0);
     } else { assert(!"unknown HID case"); }
     puts(argv[1]); return 0;
 }
@@ -322,19 +370,29 @@ int main(int argc, char **argv) {
 '''
 
 cases = ['hid-idle', 'hid-producer-completion', 'hid-retry', 'hid-ready', 'hid-reserved-head', 'hid-control-reserve', 'hid-registration', 'hid-frame-backlog',
+         'hid-event-stale-retry', 'hid-event-valid-retry', 'hid-event-classification',
          'cdc-idle', 'cdc-full-zero', 'cdc-disable-race', 'cdc-close-reopen', 'cdc-stop-start', 'cdc-wrap']
 selected = args.case or cases
 with tempfile.TemporaryDirectory(prefix='receiver-wake-smoke-') as directory:
     temp = Path(directory)
+    spec=importlib.util.spec_from_file_location('event_host_runner',Path(__file__).resolve().parents[1]/'tracker_events/run.py')
+    event_runner=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(event_runner)
+    (temp/'zephyr/logging').mkdir(parents=True)
+    (temp/'zephyr/kernel.h').write_text(event_runner.KERNEL)
+    (temp/'zephyr/logging/log.h').write_text(event_runner.LOGGING)
     binaries = {}
     for name, content in [('hid',hid),('cdc',cdc)]:
         if not any(case.startswith(name+'-') for case in selected):
             continue
         cpath=temp/(name+'.c'); cpath.write_text(content)
         binary=temp/name
+        event_sources=[str(src/'tracker_events.c')] if name=='hid' else []
         subprocess.run(shlex.split(os.environ.get('CC','cc'))+[
             '-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unused-function','-Wno-unused-variable',
-            '-g','-O1','-fsanitize=address,undefined','-fno-omit-frame-pointer','-fno-pie','-no-pie',str(cpath),'-o',str(binary)], check=True)
+            '-Wno-misleading-indentation','-Wno-unused-but-set-variable',
+            '-I'+str(temp),'-I'+str(src),
+            '-g','-O1','-fsanitize=address,undefined','-fno-omit-frame-pointer','-fno-pie','-no-pie',str(cpath),*event_sources,'-o',str(binary)], check=True)
         binaries[name]=binary
     failed=[]
     for case in selected:
