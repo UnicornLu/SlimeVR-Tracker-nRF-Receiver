@@ -197,6 +197,11 @@ void sys_request_system_off(void)
 void sys_request_system_reboot(void)
 {
 	LOG_INF("System reboot requested");
+	/* LED strips latch their last frame and the bootloader does not drive them,
+	 * so clear the indicator before leaving the application (UF2/DFU entries
+	 * would otherwise keep the last pattern color lit).
+	 */
+	set_led(SYS_LED_PATTERN_OFF_FORCE, SYS_LED_PRIORITY_HIGHEST);
 	sys_reboot(SYS_REBOOT_COLD);
 }
 
