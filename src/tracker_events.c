@@ -10,10 +10,20 @@ LOG_MODULE_REGISTER(tracker_events, LOG_LEVEL_INF);
 
 #define OP_COUNT 8
 #define RX_COUNT 32
+/* Receipt-time context, not proof of entry: 5 s WOM lead + 10 s calibration
+ * silence + 5 s scheduling margin. Repeated notices never renew this budget. */
+#define POWER_INTENT_RELEVANCE_MS 20000U
+#define POWER_INTENT_ACTIVITY_MS 10000U
 struct event_cache {
 	struct tracker_event event;
-	uint32_t last_rx, version, notified_generation, order;
+	uint32_t last_rx, version, notified_generation, order, first_order;
 	bool used, terminal, stale;
+};
+struct power_intent {
+	uint32_t received_at, order, watermark_order;
+	uint16_t sequence;
+	uint8_t phase;
+	bool ordered;
 };
 struct tracker_cache {
 	uint32_t pairing_generation, nonce, retired_nonce, retired_at, high_at, order;
@@ -21,6 +31,7 @@ struct tracker_cache {
 	uint64_t seen;
 	bool initialized;
 	struct event_cache operations[OP_COUNT], rest[2];
+	struct power_intent power;
 };
 struct rx_event {
 	struct tracker_event event;
@@ -190,6 +201,10 @@ static bool unseen(struct tracker_cache *tracker, uint16_t seq, uint32_t now)
 {
 	if (!tracker->initialized || (uint32_t)(now - tracker->high_at) >= TRACKER_EVENT_TTL_MS) {
 		tracker->order += 65536U;
+		/* Rebase, rather than discard, the power watermark. A delayed notice
+		 * older than a cancellation remains older in the new coordinate. */
+		if (tracker->power.ordered)
+			tracker->power.watermark_order = tracker->order + (int16_t)(tracker->power.sequence - seq);
 		tracker->initialized = true;
 		tracker->high = seq;
 		tracker->seen = 1;
@@ -247,6 +262,64 @@ static struct delivery observation(const struct event_cache *cache, uint8_t reas
 	return out;
 }
 
+static void power_notice(struct tracker_cache *tracker, const struct tracker_event *event,
+			 uint32_t order, uint32_t now)
+{
+	struct power_intent *power = &tracker->power;
+	/* Expanded order tolerates continuous progress beyond the wire half-range.
+	 * unseen() preserves this watermark across its quiet-interval reanchor. */
+	if (power->ordered && (int32_t)(order - power->watermark_order) <= 0) return;
+	power->ordered = true;
+	power->sequence = event->event_seq;
+	power->watermark_order = order;
+	if (power->phase && (uint32_t)(now - power->received_at) >= POWER_INTENT_RELEVANCE_MS)
+		power->phase = 0;
+	switch (event->phase) {
+	case POWER_WILL_WOM:
+	case POWER_WILL_SHUTDOWN:
+	case POWER_WILL_REBOOT:
+		if (power->phase != event->phase) {
+			power->received_at = now;
+			power->order = order;
+		}
+		power->phase = event->phase;
+		break;
+	case POWER_WOM_CANCELLED:
+		if (power->phase == POWER_WILL_WOM) power->phase = 0;
+		break;
+	case POWER_BOOT:
+	case POWER_WAKE:
+	case POWER_WATCHDOG_RESET:
+		power->phase = 0;
+		break;
+	}
+}
+
+static void power_operation_evidence(struct tracker_cache *tracker,
+				    const struct tracker_event *event, uint32_t order, uint32_t now)
+{
+	struct power_intent *power = &tracker->power;
+	if (!power->phase) return;
+	if ((uint32_t)(now - power->received_at) >= POWER_INTENT_RELEVANCE_MS
+	    || ((int32_t)(order - power->order) > 0
+		&& (event->event == CAL_EVENT_ACCEPTED || event->event == CAL_EVENT_BEGIN))
+	    || (uint32_t)(now - power->received_at) > POWER_INTENT_ACTIVITY_MS) {
+		/* A new operation, or ongoing operation evidence beyond the entry
+		 * window, makes this old intention unsuitable as silence context. */
+		power->phase = 0;
+	}
+}
+
+static uint8_t silence_reason(struct tracker_cache *tracker, const struct event_cache *cache, uint32_t now)
+{
+	struct power_intent *power = &tracker->power;
+	if (power->phase && (uint32_t)(now - power->received_at) >= POWER_INTENT_RELEVANCE_MS)
+		power->phase = 0;
+	if (!power->phase || (int32_t)(cache->first_order - power->order) > 0)
+		return CAL_REASON_TRANSPORT_SILENCE;
+	return power->phase == POWER_WILL_REBOOT ? CAL_REASON_RESET : CAL_REASON_POWER_DOWN;
+}
+
 static const char *lookup(const char *const *names, size_t count, uint8_t value)
 {
 	return value < count ? names[value] : "unknown";
@@ -264,6 +337,7 @@ static void log_delivery(const struct delivery *out)
 	static const char *const rest_reasons[] = {"OBSERVED", "RESET", "SUSPENDED", "NO_FRESH_FRAME", "INITIALIZING"};
 	static const char *const backends[] = {"UNKNOWN", "VQF", "EQF"};
 	static const char *const power_reasons[] = {"UNKNOWN", "WOM_NORMAL", "WOM_FORCED"};
+	static const char *const power_phases[] = {"NONE", "WILL_WOM", "WILL_SHUTDOWN", "BOOT", "WAKE", "WILL_REBOOT", "WOM_CANCELLED", "WATCHDOG_RESET"};
 	const struct tracker_event *e = &out->event;
 	bool cal = tracker_event_is_calibration(e->kind);
 	const char *kind, *phase, *detail = "value";
@@ -280,7 +354,9 @@ static void log_delivery(const struct delivery *out)
 	} else if (e->kind == TRACKER_EVENT_KIND_FUSION_REST) {
 		kind = "FUSION_REST"; phase = lookup(fusion_phases, 4, e->phase); detail = lookup(backends, 3, e->detail);
 	} else if (e->kind == TRACKER_EVENT_KIND_POWER) {
-		kind = "POWER"; phase = e->phase == POWER_WILL_WOM ? "WILL_WOM" : "WILL_SHUTDOWN"; detail = lookup(power_reasons, 3, e->detail);
+		kind = "POWER"; phase = lookup(power_phases, 8, e->phase);
+		detail = e->phase == POWER_WILL_WOM || e->phase == POWER_WOM_CANCELLED
+			? lookup(power_reasons, 3, e->detail) : "NONE";
 	} else {
 		kind = "BUTTON"; phase = "CLICK_GROUP"; detail = e->detail == 255 ? "count_at_least" : "count";
 	}
@@ -335,12 +411,15 @@ static void process_rx(const struct rx_event *rx)
 		tracker->initialized = false;
 		memset(tracker->operations, 0, sizeof(tracker->operations));
 		memset(tracker->rest, 0, sizeof(tracker->rest));
+		memset(&tracker->power, 0, sizeof(tracker->power));
 	}
 	bool state = e->event == CAL_EVENT_STATE;
 	bool storage = tracker_event_is_calibration(e->kind) && e->event == CAL_EVENT_STEP && e->phase == CAL_PHASE_STORAGE;
 	struct event_cache *cache = state ? &tracker->rest[e->kind == TRACKER_EVENT_KIND_FUSION_REST] : find_operation(tracker, e);
 	/* Long-lived heartbeats must be recognized before the half-range window. */
 	if (cache && cache->used && same_event(&cache->event, e)) {
+		if (tracker_event_is_calibration(e->kind))
+			power_operation_evidence(tracker, e, cache->order, rx->received_at);
 		cache->last_rx = rx->received_at;
 		if (cache->stale) {
 			cache->stale = false;
@@ -358,6 +437,7 @@ static void process_rx(const struct rx_event *rx)
 	if (state && cache->used && (int32_t)(order - cache->order) <= 0) goto done;
 	output[count++] = (struct delivery){.event = *e, .opcode = RCV_HID_OP_TRACKER_EVENT,
 		.generation = rx->subscription_generation, .received_at = rx->received_at};
+	if (e->kind == TRACKER_EVENT_KIND_POWER) power_notice(tracker, e, order, rx->received_at);
 	if (state || (tracker_event_is_calibration(e->kind) && !storage)) {
 		bool replacing = cache == NULL;
 		if (replacing) cache = allocate_operation(tracker, rx->received_at);
@@ -366,8 +446,10 @@ static void process_rx(const struct rx_event *rx)
 		 * roll back a terminal result or the newest phase of an operation. */
 		if (replacing || !cache->used || ((int32_t)(order - cache->order) > 0 && (!cache->terminal || terminal))) {
 			uint32_t version = next_generation(cache->version);
+			if (!state) power_operation_evidence(tracker, e, order, rx->received_at);
+			uint32_t first_order = replacing || !cache->used ? order : cache->first_order;
 			*cache = (struct event_cache){.event = *e, .last_rx = rx->received_at, .version = version,
-				.order = order, .used = true, .terminal = terminal};
+				.order = order, .first_order = first_order, .used = true, .terminal = terminal};
 			output[count - 1].cache_version = version;
 		}
 	}
@@ -394,7 +476,8 @@ void tracker_events_process(uint32_t now)
 			uint32_t timeout = state ? TRACKER_EVENT_REST_STALE_MS : TRACKER_EVENT_CAL_SILENCE_MS;
 			if (cache->used && !cache->terminal && !cache->stale && (uint32_t)(now - cache->last_rx) >= timeout) {
 				cache->stale = true;
-				out = observation(cache, CAL_REASON_TRANSPORT_SILENCE, now);
+				out = observation(cache, state ? CAL_REASON_TRANSPORT_SILENCE
+					: silence_reason(&trackers[t], cache, now), now);
 				send = log_event = true;
 			} else if (state && cache->used && !cache->stale && matches(t, cache->event.kind, now)
 			           && cache->notified_generation != subscription_generation) {

@@ -16,3 +16,6 @@ compile_commands.json
 # python-generated files
 __pycache__/
 *.py[oc]
+
+# Local tracker event captures
+tracker-events-*.jsonl

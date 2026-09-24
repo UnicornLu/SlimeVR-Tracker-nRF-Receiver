@@ -22,7 +22,8 @@ Packet types in ESB payload (byte 0):
   0x11: Raw Mag (17 bytes) - float body-frame aligned magnetometer
   meta: raw TX Hz, optional chip/fusion Hz after mag_id
 
-Output: CSV file with columns: seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp
+Output: CSV columns end in temp,discontinuity; gyrQuat uses qw,qx,qy,qz
+instead of gx,gy,gz. A discontinuity marks unknown loss, not proven reboot.
 """
 
 import argparse
@@ -31,6 +32,8 @@ import struct
 import sys
 import time
 from pathlib import Path
+from data_collect_reorder import SampleReorder
+
 
 from data_collect_common import (
     META_MASK_ACCEL,
@@ -330,8 +333,6 @@ def find_data_hid(device_index=None):
 class _CollectorState:
     """Independent metadata, calibration, output, and sequence state."""
 
-    REORDER_BUF_MAX = 200
-
     def __init__(self, output_path, tracker_id=None):
         self.tracker_id = tracker_id
         self.control_tracker_id = tracker_id if tracker_id is not None else 0
@@ -341,12 +342,10 @@ class _CollectorState:
         self.frame_count = 0
         self.sample_count = 0
         self.last_rssi = 0
-        self.retransmit_count = 0
-        self.gap_count = 0
+        self.reorder = SampleReorder(self._write_sample)
         self.meta_written = False
         self.raw_seen = False
-        self.reorder_buf = {}
-        self.write_cursor = None
+        self.reorder_buf = self.reorder.pending
         self.csv_file = None
         self.data_mode = "raw"
         base = Path(output_path)
@@ -366,7 +365,7 @@ class _CollectorState:
             self.csv_file.close()
         self.data_mode = data_mode
         self.csv_file = open(self.csv_path, "w", encoding="utf-8")
-        header = "seq,qw,qx,qy,qz,ax,ay,az,mx,my,mz,temp\n" if data_mode == "gyr_quat" else "seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp\n"
+        header = "seq,qw,qx,qy,qz,ax,ay,az,mx,my,mz,temp,discontinuity\n" if data_mode == "gyr_quat" else "seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp,discontinuity\n"
         self.csv_file.write(header)
 
     def parse_metadata(self, payload):
@@ -378,13 +377,6 @@ class _CollectorState:
     def parse_calibration(self, payload):
         self.cal.parse(payload)
         print(f"  {self.label}: Cal sub={payload[2]} accel={self.cal.accel_BAinv is not None} mag={self.cal.mag_BAinv is not None} gyro={self.cal.gyro_bias is not None}")
-    def _flush_reorder_buf(self):
-        if self.write_cursor is None:
-            return
-        while self.write_cursor in self.reorder_buf:
-            self.csv_file.write(self.reorder_buf.pop(self.write_cursor))
-            self.sample_count += 1
-            self.write_cursor = (self.write_cursor + 1) & 0xFFFF
     def metadata_complete(self):
         if not self.meta.received or self.cal.accel_BAinv is None or self.cal.gyro_bias is None:
             return False
@@ -416,11 +408,13 @@ class _CollectorState:
         return (mask, 255) if mask else None
 
     def ensure_csv(self, pkt_type):
+        mode = "gyr_quat" if pkt_type == 0x13 else "raw"
+        if mode != self.data_mode and (self.sample_count or self.reorder_buf):
+            raise ValueError("Cannot change raw/quat mode within one CSV capture")
         if self.csv_file is None:
             self._open_csv("gyr_quat" if pkt_type == 0x13 else "raw")
         elif pkt_type == 0x13 and self.data_mode == "raw":
-            # Preserve the legacy collector's mode transition semantics: a
-            # gyrQuat stream gets the data2-compatible header.
+            # The initial empty raw header may be replaced before any sample.
             self._open_csv("gyr_quat")
             if self.meta_written:
                 # Metadata is append-only after first raw data; rewrite its
@@ -450,84 +444,33 @@ class _CollectorState:
         self.meta_written = True
 
 
-    def _force_flush_reorder_buf(self):
-        if not self.reorder_buf:
-            return
-        sorted_seqs = sorted(
-            self.reorder_buf,
-            key=lambda seq: (seq - self.write_cursor) & 0xFFFF,
-        )
-        for seq in sorted_seqs:
-            gap = (seq - self.write_cursor) & 0xFFFF
-            if gap > 0:
-                self.gap_count += gap
-                self.write_cursor = seq
-            self.csv_file.write(self.reorder_buf[seq])
-            self.sample_count += 1
-            self.write_cursor = (self.write_cursor + 1) & 0xFFFF
-        self.reorder_buf.clear()
+    @property
+    def gap_count(self):
+        return self.reorder.gap_count
+
+    @property
+    def retransmit_count(self):
+        return self.reorder.retransmit_count
+
+    def _write_sample(self, sample, discontinuity):
+        self.csv_file.write(self._csv_line(sample, sample["seq"], discontinuity))
+        self.sample_count += 1
 
     def accept_raw(self, payload, pkt_type, now):
         sample = parse_raw_imu_quat(payload) if pkt_type == 0x13 else parse_raw_imu(payload)
         if not sample:
             return False
 
-        seq = sample["seq"]
-        if self.tracker_id is not None:
-            # Batch mode: no dup, no ARQ — per-tracker packets arrive in seq
-            # order and gaps are permanent. Write on arrival, count gaps now.
-            self.ensure_csv(pkt_type)
-            if self.meta.received and not self.meta_written:
-                self.write_metadata()
-            if self.write_cursor is None:
-                self.write_cursor = seq
-                self.first_sample_time = now
-                self.raw_seen = True
-            else:
-                diff = (seq - self.write_cursor) & 0xFFFF
-                if diff > 0x8000:
-                    self.retransmit_count += 1
-                    return False  # stale duplicate of already-written data
-                if diff > 0:
-                    self.gap_count += diff  # seqs [cursor, seq) never arrive
-            self.csv_file.write(self._csv_line(sample, seq))
-            self.sample_count += 1
-            self.write_cursor = (seq + 1) & 0xFFFF
-            return True
-
-        if self.write_cursor is not None:
-            diff = (seq - self.write_cursor) & 0xFFFF
-            if diff > 0x8000:
-                self.retransmit_count += 1
-                return False
-        if seq in self.reorder_buf:
-            return False
-
         self.ensure_csv(pkt_type)
         if self.meta.received and not self.meta_written:
             self.write_metadata()
 
-        if self.write_cursor is None:
-            self.write_cursor = seq
+        if self.first_sample_time is None:
             self.first_sample_time = now
             self.raw_seen = True
+        return self.reorder.push(sample, bytes(payload))
 
-        self.reorder_buf[seq] = self._csv_line(sample, seq)
-        diff = (seq - self.write_cursor) & 0xFFFF
-        if 0 < diff < self.REORDER_BUF_MAX:
-            has_later = any(
-                0 < ((other - seq) & 0xFFFF) < self.REORDER_BUF_MAX
-                for other in self.reorder_buf if other != seq
-            )
-            if has_later:
-                self.retransmit_count += 1
-
-        self._flush_reorder_buf()
-        if len(self.reorder_buf) >= self.REORDER_BUF_MAX:
-            self._force_flush_reorder_buf()
-        return True
-
-    def _csv_line(self, sample, seq):
+    def _csv_line(self, sample, seq, discontinuity=False):
         mag = sample.get("mag") or (0.0, 0.0, 0.0)
         temp = sample.get("temp_c") or 0.0
         if self.data_mode == "gyr_quat":
@@ -537,23 +480,22 @@ class _CollectorState:
                 f"{q[0]:.9f},{q[1]:.9f},{q[2]:.9f},{q[3]:.9f},"
                 f"{sample['accel'][0]:.6f},{sample['accel'][1]:.6f},{sample['accel'][2]:.6f},"
                 f"{mag[0]:.6f},{mag[1]:.6f},{mag[2]:.6f},"
-                f"{temp:.6f}\n"
+                f"{temp:.6f},{int(discontinuity)}\n"
             )
         return (
             f"{seq},"
             f"{sample['gyro'][0]:.6f},{sample['gyro'][1]:.6f},{sample['gyro'][2]:.6f},"
             f"{sample['accel'][0]:.6f},{sample['accel'][1]:.6f},{sample['accel'][2]:.6f},"
             f"{mag[0]:.6f},{mag[1]:.6f},{mag[2]:.6f},"
-            f"{temp:.6f}\n"
+            f"{temp:.6f},{int(discontinuity)}\n"
         )
 
     def flush(self):
-        if self.reorder_buf and self.write_cursor is not None:
-            self._force_flush_reorder_buf()
         if self.csv_file is not None:
             self.csv_file.flush()
 
     def finalize(self, end_time):
+        self.reorder.finish()
         self.flush()
         if self.csv_file is not None:
             self.csv_file.close()
@@ -572,6 +514,7 @@ class _CollectorState:
                 f.write(f"duration_s={data_duration:.3f}\n")
                 f.write(f"sample_count={self.sample_count}\n")
                 f.write(f"gap_count={self.gap_count}\n")
+                f.write(f"unknown_boundaries={self.reorder.unknown_boundaries}\n")
         return data_duration
 
 def collect_hid(output_path, duration=None, device_index=None, batch=False, control_port=None):
@@ -731,6 +674,7 @@ def collect_hid(output_path, duration=None, device_index=None, batch=False, cont
     print(f"  Samples: {aggregate_samples}")
     print(f"  Retransmits received: {aggregate_retx}")
     print(f"  Gaps (lost): {aggregate_gaps} ({loss_pct:.2f}%)")
+    print(f"  Unknown boundaries: {sum(s.reorder.unknown_boundaries for s in all_states)}")
     for state in all_states:
         if state.raw_seen:
             print(f"  {state.label}: {state.sample_count} samples -> {state.csv_path}")

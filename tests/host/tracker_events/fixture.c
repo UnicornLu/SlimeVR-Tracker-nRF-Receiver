@@ -291,6 +291,175 @@ static void json_rest(void)
     assert(count==4);
     dump(true);
 }
+static struct tracker_event power(uint16_t seq, uint8_t phase)
+{
+    struct tracker_event e=event(seq,CAL_EVENT_NOTICE);
+    e.operation_id=0; e.kind=TRACKER_EVENT_KIND_POWER; e.phase=phase;
+    return e;
+}
+static void assert_silence(uint8_t reason)
+{
+    assert(count==1 && records[0][2]==RCV_HID_OP_TRACKER_OBSERVATION);
+    assert(records[0][3]==((CAL_OUTCOME_UNKNOWN<<4)|CAL_EVENT_END));
+    assert(records[0][15]==reason);
+}
+static void power_timeout(void)
+{
+    const uint8_t phases[]={POWER_WILL_WOM,POWER_WILL_SHUTDOWN,POWER_WILL_REBOOT};
+    subscribe(255,31);
+    for(unsigned i=0;i<3;i++) {
+        struct tracker_event e=event(1,CAL_EVENT_BEGIN); e.tracker_id=i; receive(e);
+        e=power(2,phases[i]); e.tracker_id=i; receive(e);
+    }
+    receive(state(3,TRACKER_EVENT_KIND_TRACKER_REST));
+    receive(state(4,TRACKER_EVENT_KIND_FUSION_REST));
+    clear_output();
+    subscribe(255,31); assert(count==2); /* Intent did not invalidate rest. */
+    for(size_t i=0;i<count;i++) assert(records[i][3]==CAL_EVENT_STATE && records[i][14]==1);
+    clear_output(); tick(9999); assert(count==0);
+    tick(10000); assert(count==3);
+    for(size_t i=0;i<count;i++) {
+        assert(records[i][2]==226 && records[i][3]==0x54);
+        assert(records[i][15]==(records[i][4]==2 ? CAL_REASON_RESET : CAL_REASON_POWER_DOWN));
+    }
+    clear_output(); assert(control(2,255,31)==0); tick(15000); assert(count==2);
+    for(size_t i=0;i<count;i++) {
+        assert(records[i][2]==226 && records[i][3]==0x56 && records[i][14]==2);
+        assert(records[i][15]==(records[i][13]==TRACKER_EVENT_KIND_FUSION_REST
+                               ? FUSION_BACKEND_VQF : TRACKER_REST_OBSERVED));
+    }
+}
+static void power_cancel(void)
+{
+    subscribe(255,31);
+    receive(event(65533,CAL_EVENT_BEGIN));
+    receive(power(65534,POWER_WILL_WOM));
+    receive(power(0,POWER_WOM_CANCELLED)); clear_output();
+    receive(power(65535,POWER_WILL_WOM));
+    /* Unseen history stays observable but cannot undo cancellation, including wrap. */
+    assert(count==1 && records[0][2]==225 && records[0][14]==POWER_WILL_WOM);
+    clear_output(); tick(10000); assert_silence(CAL_REASON_TRANSPORT_SILENCE);
+}
+static void power_reanchor(void)
+{
+    subscribe(255,31);
+    struct tracker_event heartbeat=event(1,CAL_EVENT_BEGIN);
+    receive(heartbeat); receive(power(4,POWER_WOM_CANCELLED)); clear_output();
+    tick(9000); receive(heartbeat); assert(control(2,255,31)==0);
+    tick(16000); receive(power(3,POWER_WILL_WOM));
+    assert(count==1 && records[0][2]==225); /* Delivery window reanchored, not intent. */
+    clear_output(); tick(19000); assert_silence(CAL_REASON_TRANSPORT_SILENCE);
+}
+static void power_expiry(void)
+{
+    subscribe(255,31);
+    struct tracker_event heartbeat=event(1,CAL_EVENT_BEGIN);
+    struct tracker_event notice=power(2,POWER_WILL_WOM);
+    receive(heartbeat); receive(notice); clear_output();
+    tick(9000); receive(notice); assert(count==0);
+    /* Last activity at entry-window boundary; original 20s bound still wins. */
+    host_now=10000; receive(heartbeat); assert(control(2,255,31)==0);
+    tick(16000); receive(notice); clear_output();
+    tick(19999); assert(count==0);
+    tick(20000); assert_silence(CAL_REASON_TRANSPORT_SILENCE);
+}
+static void power_activity(void)
+{
+    subscribe(255,31);
+    struct tracker_event heartbeat=event(1,CAL_EVENT_BEGIN);
+    receive(heartbeat);
+    struct tracker_event other=event(2,CAL_EVENT_BEGIN); other.operation_id++;
+    receive(other); receive(power(3,POWER_WILL_WOM)); clear_output();
+    host_now=1000; receive(other); clear_output();
+    tick(9000); receive(heartbeat); assert(control(2,255,31)==0);
+    host_now=10001; receive(heartbeat); /* Ongoing operation outlives expected entry. */
+    assert(count==0); tick(11000); assert_silence(CAL_REASON_TRANSPORT_SILENCE);
+}
+static void power_new_operation(void)
+{
+    subscribe(255,31);
+    receive(event(1,CAL_EVENT_BEGIN)); receive(power(2,POWER_WILL_WOM));
+    struct tracker_event next=event(4,CAL_EVENT_BEGIN); next.operation_id++;
+    receive(next);
+    /* An unseen old warning arriving after the independent operation is not its cause. */
+    receive(power(3,POWER_WILL_SHUTDOWN)); clear_output();
+    tick(10000); assert(count==2);
+    for(size_t i=0;i<count;i++) {
+        assert(records[i][2]==226 && records[i][3]==0x54);
+        assert(records[i][15]==(tracker_event_get16(records[i]+11)==next.operation_id
+                               ? CAL_REASON_TRANSPORT_SILENCE : CAL_REASON_POWER_DOWN));
+    }
+}
+static void power_boot(void)
+{
+    subscribe(255,31);
+    receive(event(3,CAL_EVENT_BEGIN));
+    receive(state(4,TRACKER_EVENT_KIND_TRACKER_REST));
+    receive(state(5,TRACKER_EVENT_KIND_FUSION_REST));
+    clear_output();
+    receive(power(1,POWER_BOOT)); receive(power(2,POWER_WATCHDOG_RESET));
+    assert(count==2); /* Delayed boot facts do not reset current-session state. */
+    for(size_t i=0;i<count;i++) assert(records[i][2]==225 && records[i][3]==CAL_EVENT_NOTICE);
+    clear_output(); subscribe(255,31); assert(count==2);
+    clear_output(); tick(10000); assert_silence(CAL_REASON_TRANSPORT_SILENCE);
+}
+static void power_clear(void)
+{
+    const uint8_t phases[]={POWER_BOOT,POWER_WAKE,POWER_WATCHDOG_RESET};
+    subscribe(255,31);
+    for(unsigned i=0;i<3;i++) {
+        struct tracker_event e=event(1,CAL_EVENT_BEGIN); e.tracker_id=i; receive(e);
+        e=power(2,POWER_WILL_REBOOT); e.tracker_id=i; receive(e);
+        e=power(3,phases[i]); e.tracker_id=i; receive(e);
+    }
+    clear_output(); tick(10000); assert(count==3);
+    for(size_t i=0;i<count;i++) assert(records[i][2]==226 && records[i][3]==0x54
+                                     && records[i][15]==CAL_REASON_TRANSPORT_SILENCE);
+}
+static void power_reset(void)
+{
+    subscribe(255,31);
+    receive(event(1,CAL_EVENT_BEGIN)); receive(power(2,POWER_WILL_REBOOT));
+    clear_output();
+    struct tracker_event next=event(3,CAL_EVENT_BEGIN); next.nonce++; receive(next);
+    assert(count==2 && records[0][2]==226 && records[0][15]==CAL_REASON_SESSION_CHANGED);
+    clear_output(); tick(10000); assert_silence(CAL_REASON_TRANSPORT_SILENCE);
+    struct tracker_event notice=power(4,POWER_WILL_WOM); notice.nonce=next.nonce;
+    clear_output(); receive(notice); assert(count==1 && records[0][2]==225);
+    tracker_events_pairing_invalidate(BIT(2)); tracker_events_pairing_cleanup();
+    subscribe(255,31); clear_output();
+    receive(event(5,CAL_EVENT_BEGIN)); clear_output();
+    tick(20000); assert_silence(CAL_REASON_TRANSPORT_SILENCE);
+}
+static void json_power(void)
+{
+    subscribe(255,31);
+    for(uint8_t phase=POWER_WILL_WOM;phase<=POWER_WATCHDOG_RESET;phase++) {
+        struct tracker_event e=power(phase,phase);
+        if(phase==POWER_WILL_WOM) e.detail=POWER_WOM_NORMAL;
+        if(phase==POWER_WOM_CANCELLED) e.detail=POWER_WOM_FORCED;
+        receive(e); receive(e); /* Only a single fact for each repeated notice. */
+    }
+    assert(count==7); dump(true);
+    subscribe(255,31); assert(count==0); /* Lifecycle notices remain live-only. */
+}
+static void power_long_sequence(bool reanchor)
+{
+    subscribe(255,31);
+    receive(power(1,POWER_WOM_CANCELLED)); clear_output();
+    if(reanchor) {
+        tick(16000); subscribe(255,31);
+        receive(power(0,POWER_WILL_WOM)); clear_output();
+    }
+    struct tracker_event button=power(2,BUTTON_CLICK_GROUP);
+    button.kind=TRACKER_EVENT_KIND_BUTTON; button.detail=1;
+    for(uint32_t seq=2;seq<=32770;seq++) {
+        button.event_seq=(uint16_t)seq; receive(button); clear_output();
+    }
+    receive(event(32771,CAL_EVENT_BEGIN));
+    receive(power(32772,POWER_WILL_WOM)); clear_output();
+    tick(host_now+10000); assert_silence(CAL_REASON_POWER_DOWN);
+}
 static void replay(void)
 {
     char line[512]; subscribe(255,31); clear_output();
@@ -342,6 +511,18 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[1],"rest-long-sequence")) rest_long_sequence();
     else if(!strcmp(argv[1],"rest-delivery-retry")) rest_delivery_retry();
     else if(!strcmp(argv[1],"json-rest")) json_rest();
+    else if(!strcmp(argv[1],"power-timeout")) power_timeout();
+    else if(!strcmp(argv[1],"power-cancel")) power_cancel();
+    else if(!strcmp(argv[1],"power-reanchor")) power_reanchor();
+    else if(!strcmp(argv[1],"power-expiry")) power_expiry();
+    else if(!strcmp(argv[1],"power-activity")) power_activity();
+    else if(!strcmp(argv[1],"power-new-operation")) power_new_operation();
+    else if(!strcmp(argv[1],"power-boot")) power_boot();
+    else if(!strcmp(argv[1],"power-clear")) power_clear();
+    else if(!strcmp(argv[1],"power-reset")) power_reset();
+    else if(!strcmp(argv[1],"json-power")) json_power();
+    else if(!strcmp(argv[1],"power-long-sequence")) power_long_sequence(false);
+    else if(!strcmp(argv[1],"power-long-reanchor")) power_long_sequence(true);
     else abort();
     return 0;
 }

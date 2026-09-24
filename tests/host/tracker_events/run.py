@@ -21,7 +21,10 @@ import types
 
 CASES = ('golden', 'decoder', 'timeout', 'storage', 'nonce', 'sequence',
          'long-heartbeat', 'subscriptions', 'rest', 'independent', 'pairing',
-         'rest-long-sequence', 'rest-delivery-retry', 'json-rest', 'composite')
+         'rest-long-sequence', 'rest-delivery-retry', 'json-rest', 'composite',
+         'power-timeout', 'power-cancel', 'power-reanchor', 'power-expiry',
+         'power-activity', 'power-new-operation', 'power-boot', 'power-clear',
+         'power-reset', 'json-power', 'power-long-sequence', 'power-long-reanchor')
 
 KERNEL = r'''
 #ifndef HOST_KERNEL_H
@@ -168,6 +171,12 @@ def main():
                 assert decoded is not None
                 print(json.dumps(decoded,sort_keys=True))
             return
+        if args.case is None:
+            logging_spec = importlib.util.spec_from_file_location(
+                'event_test_logging', Path(__file__).with_name('logging_cases.py'))
+            logging_module = importlib.util.module_from_spec(logging_spec)
+            logging_spec.loader.exec_module(logging_module)
+            logging_module.logging_cases(client)
         for case in args.case or CASES:
             completed = subprocess.run([str(binary),case],text=True,capture_output=True)
             if completed.returncode:
@@ -182,6 +191,15 @@ def main():
                 assert [e['snapshot'] for e in decoded]==[True,False,True,True]
                 assert [e['phase'] for e in decoded]==['REST','UNKNOWN','REST','REST']
                 assert [e['outcome'] for e in decoded]==['NONE','UNKNOWN','NONE','NONE']
+            if case=='json-power':
+                decoded=[client.decode_tracker_event(bytes.fromhex(line.split()[1]),int(line.split()[0]))
+                         for line in completed.stdout.splitlines()]
+                assert [e['phase'] for e in decoded]==[
+                    'WILL_WOM','WILL_SHUTDOWN','BOOT','WAKE','WILL_REBOOT',
+                    'WOM_CANCELLED','WATCHDOG_RESET']
+                assert [e['detail'] for e in decoded]==['WOM_NORMAL',0,0,0,0,'WOM_FORCED',0]
+                assert all(e['source']=='tracker' and not e['snapshot'] and e['event']=='NOTICE'
+                           and e['outcome']=='NONE' and e['origin'] is None for e in decoded)
             print('PASS '+case,flush=True)
 
 

@@ -27,6 +27,8 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict, deque
 import json
+import os
+import queue
 import struct
 import sys
 import threading
@@ -127,7 +129,8 @@ def decode_tracker_event(record: bytes, received_monotonic_ms: int | None = None
     phase_names = CAL_PHASES if calibration else {
         0x20: {0: "NOT_REST", 1: "REST", 2: "UNKNOWN"},
         0x21: {0: "NOT_REST_DETECTED", 1: "REST_DETECTED", 2: "UNKNOWN", 3: "UNAVAILABLE"},
-        0x30: {1: "WILL_WOM", 2: "WILL_SHUTDOWN"},
+        0x30: {1: "WILL_WOM", 2: "WILL_SHUTDOWN", 3: "BOOT", 4: "WAKE",
+               5: "WILL_REBOOT", 6: "WOM_CANCELLED", 7: "WATCHDOG_RESET"},
         0x31: {1: "CLICK_GROUP"},
     }.get(kind, {})
     decoded_detail: int | str = detail
@@ -137,7 +140,7 @@ def decode_tracker_event(record: bytes, received_monotonic_ms: int | None = None
         decoded_detail = enum_name(REST_REASONS, detail)
     elif kind == 0x21:
         decoded_detail = enum_name(FUSION_BACKENDS, detail)
-    elif kind == 0x30:
+    elif kind == 0x30 and phase in (1, 6):
         decoded_detail = enum_name({0: "UNKNOWN", 1: "WOM_NORMAL", 2: "WOM_FORCED"}, detail)
     result = {
         "source": "tracker" if record[2] == RCV_HID_OP_TRACKER_EVENT else "receiver",
@@ -839,8 +842,63 @@ class CalibrationWatch:
         return self.result
 
 
+class JsonlEventWriter:
+    """Append-only JSONL mirror; the worker owns file writes and closure."""
+
+    _STOP = object()
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.appended = os.path.exists(path)
+        self._fh = open(path, "a", encoding="utf-8", newline="\n")
+        self._queue: queue.Queue[str | object] = queue.Queue()
+        self._failed = False
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._drain, name="jsonl-event-writer", daemon=True
+        )
+        try:
+            self._thread.start()
+        except Exception:
+            self._fh.close()
+            raise
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                item = self._queue.get()
+                if item is self._STOP:
+                    return
+                if not self._failed:
+                    try:
+                        self._fh.write(item)
+                        self._fh.flush()
+                    except OSError as exc:
+                        self._failed = True
+                        print(f"event log write failed ({self.path}): {exc}; "
+                              "continuing without file capture", file=sys.stderr)
+        finally:
+            try:
+                self._fh.close()
+            except OSError as exc:
+                print(f"event log close failed ({self.path}): {exc}", file=sys.stderr)
+
+    def write(self, line: str) -> None:
+        if not self._closed and not self._failed:
+            self._queue.put(line + "\n")
+
+    def close(self) -> None:
+        # The watch loop is the sole producer. Its queued lines precede STOP.
+        if not self._closed:
+            self._closed = True
+            self._queue.put(self._STOP)
+        # No timeout: ordinary shutdown must drain, not race a live writer.
+        self._thread.join()
+
+
 def watch_events(client: HidCmdClient, target: int, mask: int,
-                 command: tuple[int, bytes] | None = None, kind: int | None = None) -> int:
+                 command: tuple[int, bytes] | None = None, kind: int | None = None,
+                 writer: JsonlEventWriter | None = None) -> int:
     try:
         client.subscribe(target, mask)
         association = None
@@ -859,7 +917,10 @@ def watch_events(client: HidCmdClient, target: int, mask: int,
             result = None
             while client.events:
                 event = client.events.popleft()
-                print(json.dumps(event, separators=(",", ":")), flush=True)
+                line = json.dumps(event, separators=(",", ":"))
+                print(line, flush=True)
+                if writer is not None:
+                    writer.write(line)
                 if association is not None:
                     result = association.observe(event)
             if result is not None:
@@ -889,6 +950,8 @@ def main() -> int:
             "  send 0 sens auto z 5\n"
             "  send --watch-calibration 0 calibrate\n"
             "  events-watch all --kinds calibration,tracker-rest,fusion-rest,power,button\n"
+            "  events-watch all --out capture.jsonl\n"
+            "  events-watch all --no-log\n"
             "  send all sens reset\n"
             "  send 1 reset zro\n"
             "  send all tcal auto on\n"
@@ -950,13 +1013,23 @@ def main() -> int:
     )
 
     p_events = sub.add_parser("events-watch", help="Stream tracker events as JSON until Ctrl-C")
-    p_events.add_argument("target", nargs="?", default="all", help="tracker 0..15 or all")
-    p_events.add_argument("--kinds", default=",".join(KIND_MASKS),
+    p_events.add_argument("target", nargs="?", default="all", type=parse_target,
+                          help="tracker 0..15 or all")
+    p_events.add_argument("--kinds", default=",".join(KIND_MASKS), type=parse_kind_mask,
                           help="Comma-separated calibration,tracker-rest,fusion-rest,power,button")
+    p_log = p_events.add_mutually_exclusive_group()
+    p_log.add_argument("--out", default=None, metavar="PATH",
+                       help="JSONL log file (default tracker-events-<timestamp>.jsonl; "
+                            "appended when it already exists)")
+    p_log.add_argument("--no-log", action="store_true",
+                       help="Terminal output only; skip the JSONL log file")
 
     p_flags = sub.add_parser("flags", help="List all tracker PONG flag names")
 
     args = parser.parse_args()
+
+    if args.cmd == "events-watch" and args.target not in (*range(16), RCV_HID_TARGET_ALL):
+        parser.error("event target must be 0..15 or all")
 
     if args.gui:
         return run_gui()
@@ -987,9 +1060,21 @@ def main() -> int:
         return 1
 
     client = HidCmdClient(path)
+    writer = None
     try:
         if args.cmd == "events-watch":
-            return watch_events(client, parse_target(args.target), parse_kind_mask(args.kinds))
+            if not args.no_log:
+                log_path = args.out if args.out is not None else (
+                    f"tracker-events-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+                )
+                try:
+                    writer = JsonlEventWriter(log_path)
+                except OSError as exc:
+                    print(f"Error: cannot open event log {log_path}: {exc}", file=sys.stderr)
+                    return 1
+                print(f"Event log: {os.path.abspath(log_path)}"
+                      f"{' (append)' if writer.appended else ''}", file=sys.stderr)
+            return watch_events(client, args.target, args.kinds, writer=writer)
         if args.cmd == "nop":
             st, pl = client.command(RCV_HID_OP_NOP)
         elif args.cmd == "info":
@@ -1066,7 +1151,11 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     finally:
-        client.close()
+        try:
+            client.close()
+        finally:
+            if writer is not None:
+                writer.close()
 
 
 if __name__ == "__main__":

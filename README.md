@@ -86,6 +86,8 @@ interface. From this repository:
 
 ```sh
 uv run scripts/hid_cmd.py events-watch all
+uv run scripts/hid_cmd.py events-watch all --out capture.jsonl
+uv run scripts/hid_cmd.py events-watch all --no-log
 uv run scripts/hid_cmd.py events-watch 0 --kinds tracker-rest,fusion-rest,button
 uv run scripts/hid_cmd.py send --watch-calibration 0 calibrate
 uv run scripts/hid_cmd.py send --watch-calibration 0 mag cal
@@ -96,8 +98,17 @@ uv run scripts/hid_cmd.py send --watch-calibration 0 sens auto z 5
 `calibration`, `tracker-rest`, `fusion-rest`, `power`, and `button`; all are
 enabled by default. The client renews its 15-second lease every five seconds and
 attempts to unsubscribe on Ctrl-C. A new subscription can receive fresh current
-rest snapshots, but does not replay previous button actions, power intentions,
+rest snapshots, but does not replay previous button actions, power notices,
 or calibration results. The lease is device-wide, not a multi-client router.
+
+By default, `events-watch` mirrors its JSON lines to
+`tracker-events-YYYYMMDD-HHMMSS.jsonl` in the current directory. `--out PATH`
+selects an append-only file; `--no-log` keeps terminal output only. These options
+are mutually exclusive. File status and errors go to stderr.
+The background writer flushes each record and drains queued records before
+closing on normal exit; slow storage can delay process exit after HID closes.
+Write failures are reported while terminal watching continues.
+`send --watch-calibration` remains terminal-only.
 
 `send --watch-calibration` subscribes before sending a supported calibration
 command and associates its user-origin `ACCEPTED` operation with the resulting
@@ -114,8 +125,26 @@ flash persistence. Silence produces a receiver observation with `UNKNOWN`, not
 a fabricated tracker failure. Rest states are coalesced current observations,
 not a complete edge history; fusion not detecting rest does not mean motion.
 Button `count_exact=false` with `count=255` means at least 255 recognized
-presses. `WILL_WOM` and `WILL_SHUTDOWN` are intentions only, and actual power
-transitions do not wait for notification delivery.
+presses.
+
+Power phases are `WILL_WOM`, `WILL_SHUTDOWN`, `BOOT`, `WAKE`, `WILL_REBOOT`,
+`WOM_CANCELLED`, and `WATCHDOG_RESET`. Startup notices are delayed three seconds;
+`WAKE` identifies a hardware SYSTEMOFF wake, not a specific GPIO. Watchdog
+reporting uses the current boot's hardware reset cause, not a historical
+retained failure channel. `WILL_WOM` is queued at least five seconds before
+sleep; interruption cancels the reversible request and sends `WOM_CANCELLED`.
+Normal shutdown/reboot gives its notice a bounded 500 ms transmission
+opportunity before teardown, without waiting for proof of delivery.
+
+An impending-power notice does not mark a tracker asleep/offline or invalidate
+its calibration/rest observations. On calibration silence, a relevant preceding
+WOM/shutdown intention can supply `POWER_DOWN`, or a reboot intention `RESET`,
+as the reason of a receiver `UNKNOWN` observation. This inference expires after
+20 seconds from the first notice, is not extended by repeats, and is withdrawn
+by cancellation or superseding activity/session evidence. Reordered old notices
+cannot rearm a cancelled intention. These reasons do not prove the transition
+completed; rest observations retain their own domain-specific details. A delayed
+`BOOT`/`WAKE` does not erase observations already received in the same session.
 
 ## License
 Unless otherwise specified, all code in this repository is dual-licensed under either:
